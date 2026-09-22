@@ -127,8 +127,17 @@ public struct CaptureLedger: Codable, Equatable, Sendable {
             pending[i].state = .waiting; pending[i].attempts = 0; pending[i].nextAttempt = .distantPast
         }
     }
+    private static let hexadecimalDigits = Array("0123456789abcdef".utf8)
+
     private static func nameKey(_ name: String) -> String {
-        SHA256.hash(data: Data(name.utf8)).map { String(format: "%02x", $0) }.joined()
+        // Keep the lowercase SHA-256 representation used by persisted ledgers.
+        var encoded = [UInt8]()
+        encoded.reserveCapacity(64)
+        for byte in SHA256.hash(data: Data(name.utf8)) {
+            encoded.append(hexadecimalDigits[Int(byte >> 4)])
+            encoded.append(hexadecimalDigits[Int(byte & 0x0f)])
+        }
+        return String(decoding: encoded, as: UTF8.self)
     }
 }
 
