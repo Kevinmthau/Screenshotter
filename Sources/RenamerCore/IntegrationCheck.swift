@@ -35,7 +35,18 @@ protocol IntegrationRenaming {
     func undo(entryID: UUID) throws -> RenameJournalEntry
 }
 
-extension SafeFileRenamer: IntegrationRenaming {}
+/// Keep the diagnostic boundary independent of optional production rename inputs.
+private final class IntegrationFileRenamer: IntegrationRenaming {
+    private let renamer: SafeFileRenamer
+
+    init(journalURL: URL) throws { renamer = try SafeFileRenamer(journalURL: journalURL) }
+
+    func rename(_ snapshot: FileSnapshot, title: String, captureDate: Date, captureDay: CaptureDay?) throws -> RenameJournalEntry {
+        try renamer.rename(snapshot, title: title, captureDate: captureDate, captureDay: captureDay)
+    }
+
+    func undo(entryID: UUID) throws -> RenameJournalEntry { try renamer.undo(entryID: entryID) }
+}
 
 private enum IntegrationVerificationError: String, LocalizedError {
     case noSamples = "No generated samples were available for verification."
@@ -67,7 +78,7 @@ public struct IntegrationCheckRunner {
     init(availability: @escaping () async -> CodexAvailability,
          analyze: @escaping (URL) async throws -> NamingSuggestion,
          createSamples: @escaping (URL) throws -> [URL] = SampleScreenshots.create,
-         makeRenamer: @escaping (URL) throws -> any IntegrationRenaming = { try SafeFileRenamer(journalURL: $0) }) {
+         makeRenamer: @escaping (URL) throws -> any IntegrationRenaming = { try IntegrationFileRenamer(journalURL: $0) }) {
         self.availability = availability
         self.analyze = analyze
         self.createSamples = createSamples
