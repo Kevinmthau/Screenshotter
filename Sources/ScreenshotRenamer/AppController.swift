@@ -47,6 +47,8 @@ private struct SavedSettings: Codable {
     private var wakeObserver: NSObjectProtocol?
     private var lastPruned = Date.distantPast
     private var lastRendered: UIState?
+    private var lastHistoryEntries: [RenameJournalEntry] = []
+    private var historyPresentation: [UIHistoryItem] = []
 
     init() {
         support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -425,10 +427,16 @@ private struct SavedSettings: Codable {
             settings.paused ? "No new images will be submitted or renamed. An image already submitted cannot be recalled." :
             failedCount > 0 ? "\(failedCount) captures need attention. Resolve the issue, then use Retry Pending." :
             settings.enabled ? "Watching for new screenshots · \(pendingCount) pending" : "Choose Desktop, preview generated samples, then enable automatic naming.")
-        let history = (renamer?.history ?? []).sorted { $0.timestamp > $1.timestamp }.map {
-            UIHistoryItem(id: $0.id, original: $0.originalURL.lastPathComponent, renamed: $0.newURL.lastPathComponent,
-                          date: $0.timestamp, state: $0.state.rawValue, canUndo: $0.state == .renamed)
+        // Keep the journal snapshot so timer/status renders reuse its presentation.
+        let historyEntries = renamer?.history ?? []
+        if historyEntries != lastHistoryEntries {
+            historyPresentation = historyEntries.sorted { $0.timestamp > $1.timestamp }.map {
+                UIHistoryItem(id: $0.id, original: $0.originalURL.lastPathComponent, renamed: $0.newURL.lastPathComponent,
+                              date: $0.timestamp, state: $0.state.rawValue, canUndo: $0.state == .renamed)
+            }
+            lastHistoryEntries = historyEntries
         }
+        let history = historyPresentation
         let suggestions = settings.suggestions.reversed().map { UIPreviewItem(original: $0.original, proposed: $0.proposed, details: $0.detail) }
         let state = UIState(status: status, detail: detail, folder: folder?.path, codexStatus: codexStatus,
                           isEnabled: settings.enabled, isPaused: settings.paused, isBusy: busy || checking,
