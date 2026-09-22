@@ -157,6 +157,74 @@ final class CodexAnalyzerTests: XCTestCase {
         } catch { XCTAssertEqual(error as? CodexAnalysisError, .quotaExceeded) }
     }
 
+    func testOutputTailRetainsOrderAcrossWrapsAndLargeWrites() {
+        var tail = OutputTailBuffer(capacity: 8)
+        XCTAssertEqual(tail.data, Data())
+        tail.append(Array("abc".utf8)[...])
+        XCTAssertEqual(String(decoding: tail.data, as: UTF8.self), "abc")
+        tail.append(Array("defghijk".utf8)[...])
+        XCTAssertEqual(String(decoding: tail.data, as: UTF8.self), "defghijk")
+        tail.append(Array("lmnopqrs".utf8)[...])
+        XCTAssertEqual(String(decoding: tail.data, as: UTF8.self), "lmnopqrs")
+        tail.append(Array("tuvwxyz0123456789".utf8)[...])
+        XCTAssertEqual(String(decoding: tail.data, as: UTF8.self), "23456789")
+        XCTAssertEqual(tail.capacity, 8)
+    }
+
+    func testOutputFloodKeepsStorageBoundedAndFinalDiagnostics() {
+        var tail = OutputTailBuffer()
+        let bytes = [UInt8](repeating: 65, count: 8192)
+        // This stream previously retained about 156 MiB in a nominal 32 KiB Data slice.
+        for _ in 0..<20_000 { tail.append(bytes[...]) }
+        let diagnostic = Array("429 rate_limit_exceeded".utf8)
+        tail.append(diagnostic[...])
+        XCTAssertEqual(tail.capacity, 32768)
+        XCTAssertEqual(tail.data.count, 32768)
+        XCTAssertEqual(tail.data.suffix(diagnostic.count), Data(diagnostic))
+        XCTAssertEqual(CodexAnalyzer.classifyFailure(String(decoding: tail.data, as: UTF8.self)), .quotaExceeded)
+    }
+
+    func testDeadlineIncludesPipesHeldByDetachedDescendant() async throws {
+        let fixture = try detachedPipeExecutable()
+        defer { terminateDetachedFixture(fixture.marker) }
+        let start = Date()
+        do {
+            _ = try await CodexAnalyzer(executableOverride: fixture.executable, timeout: 0.2).analyze(try image())
+            XCTFail("A descendant holding stdout/stderr must remain subject to the request deadline")
+        } catch {
+            XCTAssertEqual(error as? CodexAnalysisError, .timedOut)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.5)
+        let workingDirectory = try String(contentsOf: fixture.marker.appendingPathExtension("directory"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workingDirectory))
+    }
+
+    func testCancellationAfterLeaderExitStopsPipeDrainage() async throws {
+        let fixture = try detachedPipeExecutable()
+        defer { terminateDetachedFixture(fixture.marker) }
+        let original = try image()
+        let task = Task { try await CodexAnalyzer(executableOverride: fixture.executable).analyze(original) }
+        defer { task.cancel() }
+        var leaderExited = false
+        for _ in 0..<100 {
+            if let leader = fixturePID(fixture.marker.appendingPathExtension("leader")),
+               kill(leader, 0) == -1, errno == ESRCH {
+                leaderExited = true; break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(leaderExited, "Cancel only after the leader has been reaped")
+        let start = Date()
+        task.cancel()
+        do { _ = try await task.value; XCTFail("Expected cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1)
+        let workingDirectory = try String(contentsOf: fixture.marker.appendingPathExtension("directory"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workingDirectory))
+    }
+
     func testRasterFormatsAndPDFLeaveOriginalContentsUnchanged() throws {
         let original = try image()
         let source = try XCTUnwrap(CGImageSourceCreateWithURL(original as CFURL, nil))
@@ -238,6 +306,61 @@ final class CodexAnalyzerTests: XCTestCase {
 
     private func image() throws -> URL {
         try SampleScreenshots.create(in: directory).first!
+    }
+
+    private func fixturePID(_ url: URL) -> pid_t? {
+        guard let text = try? String(contentsOf: url) else { return nil }
+        return pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func terminateDetachedFixture(_ marker: URL) {
+        if let child = fixturePID(marker.appendingPathExtension("child")) { kill(child, SIGKILL) }
+    }
+
+    private func detachedPipeExecutable() throws -> (executable: URL, marker: URL) {
+        let helper = directory.appendingPathComponent("detached-pipes")
+        let source = helper.appendingPathExtension("c")
+        let marker = directory.appendingPathComponent("detached-fixture")
+        // Compile a local fixture instead of depending on a shell's daemonization behavior.
+        // Its detached child has a short failsafe lifetime, even if the test fails.
+        try """
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <unistd.h>
+        static void record(const char *base, const char *suffix, int pid) {
+            char path[4096]; snprintf(path, sizeof(path), "%s.%s", base, suffix);
+            FILE *file = fopen(path, "w"); if (!file) _exit(2);
+            fprintf(file, "%d", pid); fclose(file);
+        }
+        int main(int argc, char **argv) {
+            if (argc != 3) return 2;
+            int ready[2]; if (pipe(ready)) return 2;
+            record(argv[2], "leader", getpid());
+            pid_t child = fork(); if (child < 0) return 2;
+            if (child == 0) {
+                close(ready[0]); if (setsid() < 0) _exit(2);
+                record(argv[2], "child", getpid());
+                if (write(ready[1], "x", 1) != 1) _exit(2);
+                close(ready[1]); sleep(3); _exit(0);
+            }
+            close(ready[1]); char byte;
+            if (read(ready[0], &byte, 1) != 1) return 2;
+            close(ready[0]);
+            FILE *response = fopen(argv[1], "w"); if (!response) return 2;
+            fputs("{\\"title\\":\\"Test\\",\\"useful\\":true}", response);
+            fclose(response); return 0;
+        }
+        """.write(to: source, atomically: true, encoding: .utf8)
+        let compiler = Process()
+        compiler.executableURL = URL(fileURLWithPath: "/usr/bin/cc")
+        compiler.arguments = [source.path, "-o", helper.path]
+        try compiler.run(); compiler.waitUntilExit()
+        guard compiler.terminationStatus == 0 else { throw CodexAnalysisError.unavailable }
+        let executable = try fakeCodex("""
+        /bin/pwd > \(quote(marker.appendingPathExtension("directory").path))
+        exec \(quote(helper.path)) "$response" \(quote(marker.path))
+        """)
+        return (executable, marker)
     }
 
     private func fakeCodex(_ body: String, loginStatus: Int = 0) throws -> URL {
