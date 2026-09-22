@@ -1,6 +1,4 @@
 import AppKit
-import CoreServices
-import Darwin
 import RenamerCore
 
 private struct ReviewSuggestion: Codable {
@@ -27,7 +25,15 @@ private struct SavedSettings: Codable {
     private var settings = SavedSettings()
     private let support: URL
     private let settingsURL: URL
-    private var renamer: SafeFileRenamer?
+    private var renamer: CaptureFileService.State?
+    private let files = CaptureFileService()
+    private var queuePolicy = CaptureQueuePolicy()
+    private var activeCapture: PendingCapture?
+    private var mutationAuthorization: FileMutationAuthorization?
+    private lazy var scans = CaptureScanScheduler(scan: { [files] in try await files.observations(in: $0) },
+                                                  receive: { [weak self] in self?.receivedScan($0) })
+    private var maintenance: Task<Void, Never>?
+    private var initialization: Task<Void, Never>?
     private var watcher: DirectoryWatcher?
     private var timer: Timer?
     private var folder: URL?
@@ -72,8 +78,7 @@ private struct SavedSettings: Codable {
                     attention = "Folder access could not be restored. Choose the Desktop folder again."
                 }
             }
-            // Restore folder access before inspecting files for interrupted rename recovery.
-            renamer = try SafeFileRenamer(journalURL: support.appendingPathComponent("history.json"))
+            // Folder scope is restored before the background service recovers the journal.
         } catch {
             fatalPersistenceError = true
             if case SafeFileError.recoveryRequired = error {
@@ -94,7 +99,20 @@ private struct SavedSettings: Codable {
             chooseCodex: { [weak self] in self?.chooseCodex() },
             quit: { [weak self] in self?.quit() }
         ))
-        if settings.enabled, folder != nil, !fatalPersistenceError { startWatching() }
+        initialization = Task { [weak self] in
+            guard let self else { return }
+            defer { self.initialization = nil }
+            do {
+                self.updateFileState(try await self.files.open(journalURL: self.support.appendingPathComponent("history.json")))
+                guard !self.isQuitting else { return }
+                if self.settings.enabled, self.folder != nil, !self.fatalPersistenceError { self.startWatching() }
+                self.tick()
+            } catch {
+                self.fatalPersistenceError = true
+                self.attention = "Rename history could not be restored. Restore folder access and restart; the history has been preserved."
+                self.render()
+            }
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
@@ -112,7 +130,7 @@ private struct SavedSettings: Codable {
     }
 
     private func chooseFolder() {
-        guard !busy, !fatalPersistenceError else { return }
+        guard !busy, initialization == nil, !fatalPersistenceError else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose Your Desktop Folder"
         panel.message = "Grant access to the Desktop folder where macOS saves screenshots. Existing files will be left alone."
@@ -122,9 +140,12 @@ private struct SavedSettings: Codable {
         guard panel.runModal() == .OK, let selected = panel.url else { return }
         do {
             let bookmark = try selected.bookmarkData(options: [.withSecurityScope])
-            _ = try FileManager.default.contentsOfDirectory(at: selected, includingPropertiesForKeys: nil)
-            generation += 1; work?.cancel(); watcher?.stop(); watcher = nil
-            if folderScope { folder?.stopAccessingSecurityScopedResource() }
+            generation += 1; mutationAuthorization?.cancel(); work?.cancel(); scans.invalidate(); watcher?.stop(); watcher = nil
+            let previousFolder = folder, previousScope = folderScope
+            Task { [files] in
+                await files.drain()
+                if previousScope { previousFolder?.stopAccessingSecurityScopedResource() }
+            }
             folder = selected; folderScope = selected.startAccessingSecurityScopedResource()
             settings.folderBookmark = bookmark; settings.folderPath = selected.path
             settings.enabled = false; settings.paused = false; settings.ledger = nil
@@ -202,14 +223,22 @@ private struct SavedSettings: Codable {
     }
 
     private func enable() {
-        guard settings.previewCompleted, available, let folder, !busy, !fatalPersistenceError else { return }
-        do {
-            let baseline = try observations(in: folder)
-            settings.ledger = CaptureLedger(baseline: baseline, activatedAt: Date())
-            settings.enabled = true; settings.paused = false; attention = nil
-            guard persist() else { return }
-            startWatching(); tick()
-        } catch { attention = "Cannot read the selected folder. Choose it again to restore access."; render() }
+        guard settings.previewCompleted, available, let folder, !busy, renamer != nil, !fatalPersistenceError else { return }
+        busy = true; render()
+        let submittedGeneration = generation
+        work = Task { [weak self] in
+            guard let self else { return }
+            defer { self.busy = false; self.work = nil; self.render() }
+            do {
+                let baseline = try await self.files.observations(in: folder)
+                guard !Task.isCancelled, !self.isQuitting, self.generation == submittedGeneration else { return }
+                self.scans.invalidate()
+                self.settings.ledger = CaptureLedger(baseline: baseline.files, activatedAt: Date())
+                self.settings.enabled = true; self.settings.paused = false; self.attention = nil
+                guard self.persist() else { return }
+                self.startWatching(); self.tick()
+            } catch { self.attention = "Cannot read the selected folder. Choose it again to restore access." }
+        }
     }
 
     private func startWatching() {
@@ -222,7 +251,7 @@ private struct SavedSettings: Codable {
     private func togglePause() {
         guard settings.enabled else { return }
         settings.paused.toggle(); generation += 1
-        if settings.paused { work?.cancel() }
+        if settings.paused { mutationAuthorization?.cancel(); work?.cancel() }
         _ = persist(); render()
         if !settings.paused { tick() }
     }
@@ -234,90 +263,93 @@ private struct SavedSettings: Codable {
     }
 
     private func tick() {
-        guard !fatalPersistenceError else { return }
-        if Date().timeIntervalSince(lastPruned) > 3600 {
-            do { try renamer?.pruneHistory(); lastPruned = Date() }
-            catch { persistenceFailed(); return }
-            settings.suggestions.removeAll { Date().timeIntervalSince($0.date) > 30 * 86400 }
-            settings.previewSamples?.removeAll { Date().timeIntervalSince($0.date) > 30 * 86400 }
-            settings.ledger?.prunePending(before: Date().addingTimeInterval(-30 * 86400))
-            _ = persist()
+        guard !fatalPersistenceError, !isQuitting, renamer != nil else { return }
+        if Date().timeIntervalSince(lastPruned) > 3600, maintenance == nil {
+            maintenance = Task { [weak self] in
+                guard let self else { return }
+                defer { self.maintenance = nil }
+                do { self.updateFileState(try await self.files.pruneHistory()); self.lastPruned = Date() }
+                catch { self.persistenceFailed(); return }
+                guard !self.isQuitting else { return }
+                self.settings.suggestions.removeAll { Date().timeIntervalSince($0.date) > 30 * 86400 }
+                self.settings.previewSamples?.removeAll { Date().timeIntervalSince($0.date) > 30 * 86400 }
+                self.settings.ledger?.prunePending(before: Date().addingTimeInterval(-30 * 86400))
+                _ = self.persist(); self.render()
+            }
         }
         guard settings.enabled, let folder, settings.ledger != nil else { render(); return }
-        do {
-            let files = try observations(in: folder)
-            let before = settings.ledger
-            overflow = settings.ledger!.reconcile(files)
-            if before != settings.ledger { guard persist() else { return } }
-            pump(); render()
-        } catch { attention = "Cannot read the watched folder. Restore Desktop access or choose the folder again."; render() }
+        scans.request(folder)
     }
 
-    private func observations(in directory: URL) throws -> [CaptureObservation] {
-        let urls = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
-        return urls.compactMap { url in
-            var info = stat()
-            guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return nil }
-            let identity = "\(UInt64(UInt32(bitPattern: info.st_dev))):\(info.st_ino)"
-            let revision = "\(info.st_size):\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec)"
-            let created = Date(timeIntervalSince1970: Double(info.st_birthtimespec.tv_sec) + Double(info.st_birthtimespec.tv_nsec) / 1_000_000_000)
-            var metadata: Bool?
-            if ScreenshotRecognition.isCandidate(name: url.lastPathComponent), let item = MDItemCreate(nil, url.path as CFString) {
-                metadata = (MDItemCopyAttribute(item, "kMDItemIsScreenCapture" as CFString) as? NSNumber)?.boolValue
-            }
-            return CaptureObservation(name: url.lastPathComponent, identity: identity, revision: revision, created: created,
-                                      captureDate: ScreenshotRecognition.captureDate(name: url.lastPathComponent, fallback: created),
-                                      eligible: ScreenshotRecognition.isCandidate(name: url.lastPathComponent, metadataIsScreenshot: metadata))
+    private func receivedScan(_ result: Result<CaptureObservationBatch, Error>) {
+        guard !fatalPersistenceError, !isQuitting, settings.enabled, settings.ledger != nil else { return }
+        switch result {
+        case .success(let observations):
+            guard reconcile(observations) else { return }
+            pump(reconciled: true); render()
+        case .failure:
+            attention = "Cannot read the watched folder. Restore Desktop access or choose the folder again."
+            render()
         }
     }
 
-    private func pump() {
+    @discardableResult private func reconcile(_ batch: CaptureObservationBatch) -> Bool {
+        guard settings.ledger != nil, !fatalPersistenceError, !isQuitting else { return false }
+        let before = settings.ledger
+        guard let result = queuePolicy.reconcile(batch, ledger: &settings.ledger!, active: activeCapture,
+                                                authorization: mutationAuthorization) else { return false }
+        overflow = result.overflow
+        if result.invalidatedActiveCapture { work?.cancel() }
+        return before == settings.ledger || persist()
+    }
+
+    private func pump(reconciled: Bool = false) {
         guard settings.enabled, !settings.paused, available, !busy, !fatalPersistenceError, !isQuitting,
               let folder else { return }
-        // Every submission starts with reconciliation, including launch, Resume and
-        // completion-driven queue advancement. Never upload a stale persisted path.
-        do {
-            let before = settings.ledger
-            overflow = settings.ledger?.reconcile(try observations(in: folder)) ?? false
-            if before != settings.ledger { guard persist() else { return } }
-        } catch {
-            attention = "Cannot read the watched folder. Restore folder access before retrying."
-            return
-        }
-        guard var job = settings.ledger?.nextReady() else { return }
+        // Completion and Resume request a fresh scan. A tick passes its existing
+        // observations through to dispatch, without a second directory traversal.
+        guard reconciled else { scans.request(folder); return }
+        guard settings.ledger != nil, let job = queuePolicy.claim(from: &settings.ledger!) else { return }
         let source = folder.appendingPathComponent(job.name)
-        job.state = .analyzing; job.attempts += 1
-        settings.ledger?.update(job)
         guard persist() else { return }
         busy = true; transientDetail = "Naming a screenshot…"; render()
         let submittedGeneration = generation
         let client = analyzer
+        let authorization = FileMutationAuthorization()
+        mutationAuthorization = authorization
+        activeCapture = job
         work = Task { [weak self] in
             guard let self else { return }
-            defer { self.busy = false; self.work = nil; self.transientDetail = nil; self.render(); self.pump() }
+            defer {
+                self.mutationAuthorization = nil
+                self.activeCapture = nil
+                self.busy = false; self.work = nil; self.transientDetail = nil; self.render(); self.pump()
+            }
             do {
-                let snapshot = try FileSnapshot.capture(at: source)
-                guard "\(snapshot.identity.device):\(snapshot.identity.inode)" == job.identity else {
-                    self.resetForLater(job.id); return
+                let pipeline = CaptureAnalysisPipeline(analyzer: client, snapshot: { [files = self.files] in
+                    try await files.snapshot(at: $0)
+                })
+                let (snapshot, result) = try await pipeline.analyze(source, for: job) { [weak self] in
+                    guard let self else { return false }
+                    return submittedGeneration == self.generation && !self.settings.paused && !self.isQuitting &&
+                        self.settings.ledger?.capture(job.id)?.identity == job.identity &&
+                        self.settings.ledger?.capture(job.id)?.revision == job.revision
                 }
-                guard job.revision.hasPrefix("\(snapshot.size):\(snapshot.modificationSeconds):\(snapshot.modificationNanoseconds):") else {
-                    self.resetForLater(job.id); return
-                }
-                let result = try await client.analyze(source)
                 // Reconcile before applying so moves, replacements and paused/resumed sessions
                 // invalidate outstanding submissions even if an old path exists again.
-                let files = try self.observations(in: folder)
-                self.settings.ledger?.reconcile(files)
+                let observations = try await self.files.observations(in: folder)
+                self.reconcile(observations)
                 guard !Task.isCancelled, submittedGeneration == self.generation, !self.settings.paused else {
                     self.resetForLater(job.id); return
                 }
-                guard let current = self.settings.ledger?.capture(job.id), current.identity == job.identity,
-                      current.revision == job.revision, try snapshot.matchesCurrentFile() else {
+                let matches = try await self.files.matches(snapshot)
+                guard !Task.isCancelled, submittedGeneration == self.generation,
+                      let current = self.settings.ledger?.capture(job.id), current.identity == job.identity,
+                      current.revision == job.revision, matches else {
                     self.resetForLater(job.id); return
                 }
                 if result.useful {
-                    guard let renamer = self.renamer else { self.persistenceFailed(); return }
-                    _ = try renamer.rename(snapshot, title: result.title, captureDate: job.captureDate, captureDay: job.namingDay)
+                    self.updateFileState(try await self.files.rename(snapshot, title: result.title, job: job, authorization: authorization))
                 } else {
                     let title = (try? FilenamePolicy.validatedTitle(result.title)) ?? "No useful description"
                     self.settings.suggestions.append(ReviewSuggestion(original: job.name, proposed: title,
@@ -326,12 +358,16 @@ private struct SavedSettings: Codable {
                 }
                 self.settings.ledger?.finish(job.id)
                 self.attention = nil; _ = self.persist()
-            } catch is CancellationError {
-                self.resetForLater(job.id)
             } catch {
-                if Task.isCancelled || submittedGeneration != self.generation { self.resetForLater(job.id); return }
+                // A post-rename journal failure must still stop processing if Pause
+                // arrived while the background transaction was completing.
+                if let state = try? await self.files.state() { self.updateFileState(state) }
                 if self.isJournalFailure(error) { self.persistenceFailed(); return }
-                if let files = try? self.observations(in: folder) { self.settings.ledger?.reconcile(files) }
+                if error is CancellationError || Task.isCancelled || submittedGeneration != self.generation {
+                    self.resetForLater(job.id); return
+                }
+                if let observations = try? await self.files.observations(in: folder) { self.reconcile(observations) }
+                if Task.isCancelled || submittedGeneration != self.generation { self.resetForLater(job.id); return }
                 guard var current = self.settings.ledger?.capture(job.id) else { _ = self.persist(); return }
                 if current.identity != job.identity || current.revision != job.revision {
                     // A failed request for the old version must not fail a fresh editor save.
@@ -342,9 +378,7 @@ private struct SavedSettings: Codable {
                     _ = self.persist(); return
                 }
                 if let error = error as? CodexAnalysisError {
-                    if error.isRetryable && current.attempts < 3 {
-                        current.state = .retry
-                        current.nextAttempt = Date().addingTimeInterval(current.attempts == 1 ? 15 : 60)
+                    if self.queuePolicy.fail(&current, with: error) {
                         self.attention = "\(error.localizedDescription) A bounded retry is pending."
                     } else {
                         current.state = .failed; self.attention = "\(error.localizedDescription) Use Retry Pending when ready."
@@ -363,28 +397,37 @@ private struct SavedSettings: Codable {
     }
 
     private func resetForLater(_ id: UUID) {
-        if var job = settings.ledger?.capture(id) {
-            job.state = .waiting; job.stableSince = Date(); job.nextAttempt = .distantPast
-            settings.ledger?.update(job)
-        }
+        if settings.ledger != nil { queuePolicy.reset(id, in: &settings.ledger!) }
         _ = persist()
     }
 
     private func undo(_ id: UUID) {
-        guard !fatalPersistenceError else { return }
-        do { _ = try renamer?.undo(entryID: id); attention = nil }
-        catch {
-            if isJournalFailure(error) { persistenceFailed(); return }
-            attention = "Undo could not safely restore this file. It may have been moved or edited, or its original name is occupied."
+        guard !busy, !fatalPersistenceError, !isQuitting else { return }
+        busy = true; render()
+        work = Task { [weak self] in
+            guard let self else { return }
+            defer { self.busy = false; self.work = nil; self.render(); self.pump() }
+            do { self.updateFileState(try await self.files.undo(id)); self.attention = nil }
+            catch {
+                if let state = try? await self.files.state() { self.updateFileState(state) }
+                if self.isJournalFailure(error) { self.persistenceFailed(); return }
+                self.attention = "Undo could not safely restore this file. It may have been moved or edited, or its original name is occupied."
+            }
         }
-        render()
     }
+
     private func clearHistory() {
-        guard !busy, !fatalPersistenceError else { return }
-        do {
-            try renamer?.clearHistory(); settings.suggestions = []; settings.previewSamples = nil; previews = []
-            _ = persist(); render()
-        } catch { persistenceFailed() }
+        guard !busy, !fatalPersistenceError, !isQuitting else { return }
+        busy = true; render()
+        work = Task { [weak self] in
+            guard let self else { return }
+            defer { self.busy = false; self.work = nil; self.render(); self.pump() }
+            do {
+                self.updateFileState(try await self.files.clearHistory())
+                self.settings.suggestions = []; self.settings.previewSamples = nil; self.previews = []
+                _ = self.persist()
+            } catch { self.persistenceFailed() }
+        }
     }
 
     @discardableResult private func persist() -> Bool {
@@ -397,9 +440,15 @@ private struct SavedSettings: Codable {
         } catch { persistenceFailed(); return false }
     }
     private func persistenceFailed() {
-        fatalPersistenceError = true; generation += 1; work?.cancel()
+        fatalPersistenceError = true; generation += 1; mutationAuthorization?.cancel(); work?.cancel(); scans.invalidate()
         attention = "Local state could not be saved. Naming has stopped to protect your files. Check available disk space and restart the app."
         render()
+    }
+
+    private func updateFileState(_ state: CaptureFileService.State) {
+        // Background completions can be delivered to the main actor out of order.
+        guard state.revision >= (renamer?.revision ?? 0) else { return }
+        renamer = state
     }
 
     private func isJournalFailure(_ error: Error) -> Bool {
@@ -432,7 +481,7 @@ private struct SavedSettings: Codable {
         let suggestions = settings.suggestions.reversed().map { UIPreviewItem(original: $0.original, proposed: $0.proposed, details: $0.detail) }
         let state = UIState(status: status, detail: detail, folder: folder?.path, codexStatus: codexStatus,
                           isEnabled: settings.enabled, isPaused: settings.paused, isBusy: busy || checking,
-                          canEnable: settings.previewCompleted && available && folder != nil && !fatalPersistenceError,
+                          canEnable: settings.previewCompleted && available && folder != nil && renamer != nil && !fatalPersistenceError,
                           history: history, previews: previews + suggestions)
         if state != lastRendered { ui.update(state); lastRendered = state }
     }
@@ -446,10 +495,14 @@ private struct SavedSettings: Codable {
 
     func stop() async {
         isQuitting = true
-        generation += 1; work?.cancel(); watcher?.stop(); timer?.invalidate()
+        generation += 1; mutationAuthorization?.cancel(); work?.cancel(); scans.invalidate(); watcher?.stop(); timer?.invalidate()
         _ = persist()
         // Allow the CLI cancellation handler to terminate its child and clean temporary files.
         await work?.value
+        await initialization?.value
+        await maintenance?.value
+        await scans.drain()
+        await files.drain()
         if folderScope { folder?.stopAccessingSecurityScopedResource(); folderScope = false }
     }
 }

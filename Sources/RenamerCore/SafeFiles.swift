@@ -289,7 +289,7 @@ public final class SafeFileRenamer {
 
     @discardableResult
     public func rename(_ snapshot: FileSnapshot, title: String, captureDate: Date,
-                       captureDay: CaptureDay? = nil) throws -> RenameJournalEntry {
+                       captureDay: CaptureDay? = nil, authorization: FileMutationAuthorization? = nil) throws -> RenameJournalEntry {
         try requireReady()
         guard (try? snapshot.matchesCurrentFile()) == true else { throw SafeFileError.fileChanged }
         let folder = snapshot.url.deletingLastPathComponent()
@@ -303,7 +303,7 @@ public final class SafeFileRenamer {
             let intent = RenameJournalEntry(originalURL: snapshot.url, newURL: destination, snapshot: snapshot, state: .renameIntent)
             try save(history + [intent])
             do {
-                try verifiedExclusiveRename(from: snapshot.url, to: destination, expected: snapshot)
+                try verifiedExclusiveRename(from: snapshot.url, to: destination, expected: snapshot, authorization: authorization)
             } catch SafeFileError.destinationExists {
                 try removeEntry(id: intent.id)
                 continue
@@ -425,7 +425,8 @@ public final class SafeFileRenamer {
         try save(history.filter { $0.id != id })
     }
 
-    private func verifiedExclusiveRename(from source: URL, to destination: URL, expected: FileSnapshot) throws {
+    private func verifiedExclusiveRename(from source: URL, to destination: URL, expected: FileSnapshot,
+                                         authorization: FileMutationAuthorization? = nil) throws {
         guard source.deletingLastPathComponent() == destination.deletingLastPathComponent() else {
             throw SafeFileError.unsafeFile("renames must stay in the same folder")
         }
@@ -434,11 +435,14 @@ public final class SafeFileRenamer {
         guard directoryFD >= 0 else { throw SafeFileError.operation("Open screenshot folder", errno) }
         defer { Darwin.close(directoryFD) }
         guard (try? expected.matchesCurrentFile(at: source)) == true else { throw SafeFileError.fileChanged }
-        let result = source.lastPathComponent.withCString { from in
-            destination.lastPathComponent.withCString { to in
-                renameatx_np(directoryFD, from, directoryFD, to, UInt32(RENAME_EXCL))
+        let mutation = {
+            source.lastPathComponent.withCString { from in
+                destination.lastPathComponent.withCString { to in
+                    renameatx_np(directoryFD, from, directoryFD, to, UInt32(RENAME_EXCL))
+                }
             }
         }
+        let result = try authorization.map { try $0.perform(mutation) } ?? mutation()
         if result != 0 {
             let code = errno
             if code == EEXIST { throw SafeFileError.destinationExists }

@@ -1,0 +1,261 @@
+import Darwin
+import Foundation
+import XCTest
+@testable import RenamerCore
+
+private actor ControlledScan {
+    var directories: [URL] = []
+    var continuations: [CheckedContinuation<CaptureObservationBatch, Error>] = []
+    func scan(_ directory: URL) async throws -> CaptureObservationBatch {
+        directories.append(directory)
+        return try await withCheckedThrowingContinuation { continuations.append($0) }
+    }
+    var count: Int { directories.count }
+    func complete(_ files: [CaptureObservation] = []) { continuations.removeFirst().resume(returning: CaptureObservationBatch(revision: UInt64(directories.count), files: files)) }
+}
+
+private actor TestAnalyzer: ScreenshotAnalyzing {
+    var count = 0
+    func analyze(_ url: URL) async throws -> NamingSuggestion {
+        count += 1
+        return NamingSuggestion(title: "Test Capture", useful: true)
+    }
+}
+
+final class CapturePipelineTests: XCTestCase {
+    private var directory: URL!
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("CapturePipelineTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+    }
+    override func tearDownWithError() throws { try? FileManager.default.removeItem(at: directory) }
+
+    @MainActor private func waitForCount(_ count: Int, in scan: ControlledScan) async throws {
+        let deadline = Date().addingTimeInterval(2)
+        while await scan.count < count {
+            guard Date() < deadline else { XCTFail("Scan did not start"); throw CocoaError(.coderInvalidValue) }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+    }
+
+    @MainActor func testBurstEventsShareOneFollowUpScan() async throws {
+        let scan = ControlledScan()
+        var delivered = 0
+        let scheduler = CaptureScanScheduler(scan: { try await scan.scan($0) }, receive: { _ in delivered += 1 })
+        scheduler.request(directory)
+        try await waitForCount(1, in: scan)
+        for _ in 0..<100 { scheduler.request(directory) }
+        await scan.complete()
+        try await waitForCount(2, in: scan)
+        await scan.complete()
+        await scheduler.drain()
+        let count = await scan.count
+        XCTAssertEqual(count, 2)
+        XCTAssertEqual(delivered, 2)
+    }
+
+    @MainActor func testInvalidatedFolderResultsCannotReachQueue() async throws {
+        let scan = ControlledScan()
+        var delivered = 0
+        let scheduler = CaptureScanScheduler(scan: { try await scan.scan($0) }, receive: { _ in delivered += 1 })
+        scheduler.request(directory)
+        try await waitForCount(1, in: scan)
+        scheduler.invalidate()
+        scheduler.request(directory.appendingPathComponent("new-folder"))
+        await scan.complete()
+        try await waitForCount(2, in: scan)
+        XCTAssertEqual(delivered, 0)
+        await scan.complete()
+        await scheduler.drain()
+        XCTAssertEqual(delivered, 1)
+        scheduler.request(directory)
+        try await waitForCount(3, in: scan)
+        scheduler.invalidate()
+        await scan.complete()
+        await scheduler.drain()
+        XCTAssertEqual(delivered, 1, "Shutdown discards outstanding scan results")
+    }
+
+    @MainActor func testBlockedFileScanDoesNotBlockMainActor() async throws {
+        let entered = expectation(description: "background scanner entered")
+        let unblock = DispatchSemaphore(value: 0)
+        let service = CaptureFileService(scan: { _ in
+            XCTAssertFalse(Thread.isMainThread)
+            entered.fulfill()
+            guard unblock.wait(timeout: .now() + 2) == .success else { throw CocoaError(.fileReadUnknown) }
+            return []
+        })
+        let task = Task { try await service.observations(in: directory) }
+        await fulfillment(of: [entered], timeout: 1)
+        unblock.signal() // Must execute on MainActor while the scanner is blocked.
+        let observations = try await task.value
+        XCTAssertTrue(observations.files.isEmpty)
+    }
+
+    func testCachedScannerStillSeesEditsRenamesAndReplacements() async throws {
+        let service = CaptureFileService()
+        let source = directory.appendingPathComponent("Screenshot 2026-09-21 at 1.00.00 PM.png")
+        try Data([1]).write(to: source)
+        let firstBatch = try await service.observations(in: directory)
+        let first = try XCTUnwrap(firstBatch.files.first)
+        try Data([1, 2, 3]).write(to: source)
+        let changedBatch = try await service.observations(in: directory)
+        let changed = try XCTUnwrap(changedBatch.files.first)
+        XCTAssertNotEqual(changed.revision, first.revision)
+        let moved = directory.appendingPathComponent("User Chosen Name.png")
+        try FileManager.default.moveItem(at: source, to: moved)
+        try Data([4]).write(to: source)
+        let next = try await service.observations(in: directory).files
+        XCTAssertEqual(next.count, 2)
+        XCTAssertFalse(try XCTUnwrap(next.first { $0.name == moved.lastPathComponent }).eligible)
+        XCTAssertNotEqual(try XCTUnwrap(next.first { $0.name == source.lastPathComponent }).identity, first.identity)
+        try FileManager.default.removeItem(at: source)
+        try FileManager.default.createSymbolicLink(at: source, withDestinationURL: moved)
+        let last = try await service.observations(in: directory).files
+        XCTAssertEqual(last.map(\.name), [moved.lastPathComponent])
+    }
+
+    @MainActor func testStaleQueueAndCancellationPreventAnalyzerSubmission() async throws {
+        let source = directory.appendingPathComponent("Screenshot 2026-09-21 at 1.00.00 PM.png")
+        try Data([1, 2, 3]).write(to: source)
+        let snapshot = try FileSnapshot.capture(at: source)
+        let job = PendingCapture(name: source.lastPathComponent, identity: "\(snapshot.identity.device):\(snapshot.identity.inode)",
+                                 revision: "\(snapshot.size):\(snapshot.modificationSeconds):\(snapshot.modificationNanoseconds):0:0",
+                                 captureDate: Date(), stableSince: .distantPast)
+        let analyzer = TestAnalyzer()
+        let pipeline = CaptureAnalysisPipeline(analyzer: analyzer, snapshot: { _ in snapshot })
+        do { _ = try await pipeline.analyze(source, for: job, isCurrent: { false }); XCTFail("Expected cancellation") }
+        catch is CancellationError {} catch { XCTFail("Unexpected \(error)") }
+        let blocked = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await pipeline.analyze(source, for: job, isCurrent: { true })
+        }
+        do { _ = try await blocked.value; XCTFail("Expected cancellation") }
+        catch is CancellationError {} catch { XCTFail("Unexpected \(error)") }
+        let count = await analyzer.count
+        XCTAssertEqual(count, 0)
+        _ = try await pipeline.analyze(source, for: job, isCurrent: { true })
+        let completed = await analyzer.count
+        XCTAssertEqual(completed, 1)
+    }
+
+    func testRevokedMutationPreservesOriginalAndRecoveryJournal() throws {
+        let source = directory.appendingPathComponent("Screenshot.png")
+        let bytes = Data([1, 2, 3])
+        try bytes.write(to: source)
+        let journal = directory.appendingPathComponent("history.json")
+        let authorization = FileMutationAuthorization()
+        authorization.cancel()
+        do {
+            let renamer = try SafeFileRenamer(journalURL: journal)
+            XCTAssertThrowsError(try renamer.rename(FileSnapshot.capture(at: source), title: "Test Capture", captureDate: Date(), authorization: authorization)) {
+                XCTAssertTrue($0 is CancellationError)
+            }
+            XCTAssertFalse(renamer.requiresRecovery)
+            XCTAssertEqual(renamer.history.last?.state, .abandoned)
+        }
+        let reopened = try SafeFileRenamer(journalURL: journal)
+        XCTAssertFalse(reopened.requiresRecovery)
+        XCTAssertEqual(try Data(contentsOf: source), bytes)
+    }
+
+    @MainActor func testPauseRevokesRenameQueuedBehindBackgroundWork() async throws {
+        let entered = expectation(description: "file queue occupied")
+        let release = DispatchSemaphore(value: 0)
+        let service = CaptureFileService(scan: { _ in
+            entered.fulfill()
+            guard release.wait(timeout: .now() + 3) == .success else { throw CocoaError(.fileReadUnknown) }
+            return []
+        })
+        _ = try await service.open(journalURL: directory.appendingPathComponent("history.json"))
+        let source = directory.appendingPathComponent("Screenshot.png")
+        try Data([1, 2, 3]).write(to: source)
+        let snapshot = try FileSnapshot.capture(at: source)
+        let job = PendingCapture(name: source.lastPathComponent, identity: "1", revision: "1",
+                                 captureDate: Date(), stableSince: .distantPast)
+        let scan = Task { try await service.observations(in: directory) }
+        await fulfillment(of: [entered], timeout: 1)
+        let authorization = FileMutationAuthorization()
+        let rename = Task { try await service.rename(snapshot, title: "Test Capture", job: job, authorization: authorization) }
+        await Task.yield()
+        authorization.cancel()
+        release.signal()
+        _ = try await scan.value
+        do { _ = try await rename.value; XCTFail("Paused rename should not commit") }
+        catch is CancellationError {} catch { XCTFail("Unexpected \(error)") }
+        XCTAssertEqual(try Data(contentsOf: source), Data([1, 2, 3]))
+        let state = try await service.state()
+        XCTAssertFalse(state.requiresRecovery)
+        XCTAssertEqual(state.history.last?.state, .abandoned)
+    }
+
+    func testCancellationSerializesWithAlreadyAuthorizedMutation() async throws {
+        let authorization = FileMutationAuthorization()
+        let entered = expectation(description: "mutation acquired authorization")
+        let cancelling = expectation(description: "cancellation attempted")
+        let release = DispatchSemaphore(value: 0)
+        let mutation = Task.detached {
+            try authorization.perform {
+                entered.fulfill()
+                return release.wait(timeout: .now() + 3) == .success
+            }
+        }
+        await fulfillment(of: [entered], timeout: 1)
+        let cancelledEarly = expectation(description: "cancellation cannot overtake mutation")
+        cancelledEarly.isInverted = true
+        let cancellation = Task.detached {
+            cancelling.fulfill()
+            authorization.cancel()
+            cancelledEarly.fulfill()
+        }
+        await fulfillment(of: [cancelling], timeout: 1)
+        await fulfillment(of: [cancelledEarly], timeout: 0.05)
+        release.signal()
+        let committed = try await mutation.value
+        await cancellation.value
+        XCTAssertTrue(committed)
+        XCTAssertThrowsError(try authorization.perform {}) { XCTAssertTrue($0 is CancellationError) }
+    }
+
+    func testStaleScanCannotLoseNewCaptureAndIneligibleScanRevokesRename() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        var policy = CaptureQueuePolicy(now: { now })
+        var ledger = CaptureLedger(baseline: [], activatedAt: now.addingTimeInterval(-10))
+        let file = CaptureObservation(name: "Screenshot 2026-09-21 at 1.00.00 PM.png", identity: "1", revision: "1",
+                                      created: now, captureDate: now, eligible: true)
+        _ = policy.reconcile(CaptureObservationBatch(revision: 2, files: [file]), ledger: &ledger, active: nil, authorization: nil)
+        XCTAssertNil(policy.reconcile(CaptureObservationBatch(revision: 1, files: []), ledger: &ledger, active: nil, authorization: nil))
+        let job = try XCTUnwrap(ledger.pending.first)
+        let authorization = FileMutationAuthorization()
+        let rejected = CaptureObservation(name: file.name, identity: file.identity, revision: file.revision,
+                                          created: file.created, captureDate: file.captureDate, eligible: false)
+        let result = policy.reconcile(CaptureObservationBatch(revision: 3, files: [rejected]), ledger: &ledger,
+                                      active: job, authorization: authorization)
+        XCTAssertEqual(result?.invalidatedActiveCapture, true)
+        XCTAssertTrue(ledger.pending.isEmpty)
+        XCTAssertThrowsError(try authorization.perform {}) { XCTAssertTrue($0 is CancellationError) }
+    }
+
+    func testQueueTransitionsUseInjectedClockAndBoundRetries() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let policy = CaptureQueuePolicy(now: { now })
+        var ledger = CaptureLedger(baseline: [], activatedAt: now.addingTimeInterval(-10))
+        ledger.reconcile([CaptureObservation(name: "Screenshot 2026-09-21 at 1.00.00 PM.png", identity: "1", revision: "1",
+                                            created: now, captureDate: now, eligible: true)], now: now.addingTimeInterval(-3))
+        var job = try XCTUnwrap(policy.claim(from: &ledger))
+        XCTAssertEqual(job.state, .analyzing)
+        XCTAssertNil(policy.claim(from: &ledger))
+        XCTAssertTrue(policy.fail(&job, with: .offline))
+        XCTAssertEqual(job.nextAttempt, now.addingTimeInterval(15))
+        job.attempts = 2
+        XCTAssertTrue(policy.fail(&job, with: .timedOut))
+        XCTAssertEqual(job.nextAttempt, now.addingTimeInterval(60))
+        job.attempts = 3
+        XCTAssertFalse(policy.fail(&job, with: .offline))
+        XCTAssertEqual(job.state, .failed)
+        ledger.update(job)
+        policy.reset(job.id, in: &ledger)
+        XCTAssertEqual(ledger.capture(job.id)?.stableSince, now)
+        XCTAssertNil(policy.claim(from: &ledger), "Resume must respect save stability")
+    }
+}
