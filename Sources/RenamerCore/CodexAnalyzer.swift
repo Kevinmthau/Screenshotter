@@ -374,8 +374,10 @@ struct CLIResult: Sendable {
 private final class CLIProcess: @unchecked Sendable {
     private let lock = NSLock()
     private var pid: pid_t = 0
+    private var wakeDescriptor: Int32 = -1
     private var cancelled = false
     private var expired = false
+    private var finished = false
 
     static func run(executable: URL, arguments: [String], environment: [String: String],
                     directory: URL, timeout: TimeInterval) async throws -> CLIResult {
@@ -396,8 +398,16 @@ private final class CLIProcess: @unchecked Sendable {
 
     private func stop(expired: Bool) {
         lock.lock(); defer { lock.unlock() }
+        guard !finished else { return }
+        let shouldSignal = !cancelled && !self.expired
         if expired { self.expired = true } else { cancelled = true }
         if pid > 0 { kill(-pid, SIGKILL) }
+        // Readers also need to stop after the leader has exited: a detached descendant
+        // can retain an inherited pipe outside the process group we can terminate.
+        if shouldSignal, wakeDescriptor >= 0 {
+            var byte: UInt8 = 1
+            while write(wakeDescriptor, &byte, 1) == -1 && errno == EINTR {}
+        }
     }
 
     private func execute(executable: URL, arguments: [String], environment: [String: String],
@@ -405,6 +415,18 @@ private final class CLIProcess: @unchecked Sendable {
         var out = [Int32](repeating: 0, count: 2), err = [Int32](repeating: 0, count: 2)
         guard pipe(&out) == 0 else { throw CodexAnalysisError.unavailable }
         guard pipe(&err) == 0 else { close(out[0]); close(out[1]); throw CodexAnalysisError.unavailable }
+        var wake = [Int32](repeating: 0, count: 2)
+        guard pipe(&wake) == 0 else {
+            out.forEach { close($0) }; err.forEach { close($0) }
+            throw CodexAnalysisError.transientFailure
+        }
+        lock.lock(); wakeDescriptor = wake[1]; lock.unlock()
+        defer {
+            // Synchronize with stop() before closing, so a late cancellation cannot
+            // write to a descriptor that has already been reused by another caller.
+            lock.lock(); wakeDescriptor = -1; lock.unlock()
+            wake.forEach { close($0) }
+        }
         let null = open("/dev/null", O_RDONLY)
         defer { if null >= 0 { close(null) } }
         var actions: posix_spawn_file_actions_t?
@@ -450,7 +472,8 @@ private final class CLIProcess: @unchecked Sendable {
         let group = DispatchGroup()
         for reader in [stdout, stderr] {
             group.enter()
-            DispatchQueue.global(qos: .utility).async { reader.drain(); group.leave() }
+            let wakeReader = wake[0]
+            DispatchQueue.global(qos: .utility).async { reader.drain(untilSignalled: wakeReader); group.leave() }
         }
         let deadline = DispatchWorkItem { [weak self] in self?.stop(expired: true) }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: deadline)
@@ -460,10 +483,15 @@ private final class CLIProcess: @unchecked Sendable {
         // Kill any inherited-pipe descendants before draining output and deleting temporary data.
         kill(-child, SIGKILL)
         pid = 0
+        lock.unlock()
+        // Keep the deadline alive until both pipes finish, including inherited pipes
+        // held open by descendants that changed their process group or session.
+        group.wait()
+        lock.lock()
+        finished = true
         let wasCancelled = cancelled, wasExpired = expired
         lock.unlock()
         deadline.cancel()
-        group.wait()
         if wasCancelled { throw CancellationError() }
         if wasExpired { throw CodexAnalysisError.timedOut }
         let exitStatus: Int32 = (status & 0x7f) == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f)
@@ -473,18 +501,56 @@ private final class CLIProcess: @unchecked Sendable {
 
 private final class BoundedPipeReader: @unchecked Sendable {
     let descriptor: Int32
-    private(set) var data = Data()
+    private var tail = OutputTailBuffer()
+    var data: Data { tail.data }
     init(descriptor: Int32) { self.descriptor = descriptor }
-    func drain() {
+    func drain(untilSignalled wakeDescriptor: Int32) {
         defer { close(descriptor) }
         var bytes = [UInt8](repeating: 0, count: 8192)
+        var descriptors = [pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0),
+                           pollfd(fd: wakeDescriptor, events: Int16(POLLIN), revents: 0)]
         while true {
+            let ready = poll(&descriptors, nfds_t(descriptors.count), -1)
+            if ready < 0 && errno == EINTR { continue }
+            // Leave the signal unread so it wakes both stdout and stderr readers.
+            guard ready > 0, descriptors[1].revents == 0 else { return }
             let count = read(descriptor, &bytes, bytes.count)
             if count < 0 && errno == EINTR { continue }
             if count <= 0 { return }
             // Keep the tail because HTTP/auth summaries normally appear at the end.
-            data.append(contentsOf: bytes.prefix(count))
-            if data.count > 32768 { data.removeFirst(data.count - 32768) }
+            tail.append(bytes.prefix(count))
         }
+    }
+}
+
+/// A fixed allocation, rather than a Data slice whose removed prefix can retain
+/// the backing storage for every byte ever read from a noisy subprocess.
+struct OutputTailBuffer {
+    private var storage: [UInt8]
+    private var writeOffset = 0
+    private var count = 0
+    var capacity: Int { storage.count }
+
+    init(capacity: Int = 32768) {
+        precondition(capacity > 0)
+        storage = [UInt8](repeating: 0, count: capacity)
+    }
+
+    mutating func append(_ bytes: ArraySlice<UInt8>) {
+        let suffix = bytes.suffix(capacity)
+        let firstCount = min(suffix.count, capacity - writeOffset)
+        storage.replaceSubrange(writeOffset..<(writeOffset + firstCount), with: suffix.prefix(firstCount))
+        let remainder = suffix.dropFirst(firstCount)
+        storage.replaceSubrange(0..<remainder.count, with: remainder)
+        writeOffset = (writeOffset + suffix.count) % capacity
+        count = min(capacity, count + suffix.count)
+    }
+
+    var data: Data {
+        let start = count == capacity ? writeOffset : 0
+        let firstCount = min(count, capacity - start)
+        var result = Data(storage[start..<(start + firstCount)])
+        result.append(contentsOf: storage.prefix(count - firstCount))
+        return result
     }
 }
