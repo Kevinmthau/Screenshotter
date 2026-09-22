@@ -44,7 +44,7 @@ struct UIState: Equatable {
 
 /// All AppKit and login-item interactions stay on the application's main actor.
 @MainActor
-final class AppUI: NSObject {
+final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
     private let actions: UIActions
     private var state = UIState()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -64,17 +64,66 @@ final class AppUI: NSObject {
     private var setupPane: NSScrollView!
     private var historyPane: NSView!
     private var segments: NSSegmentedControl!
+    private var renderedPreviews: [UIPreviewItem]?
+    private var renderedHistory: [UIHistoryItem]?
+    private var renderedHistoryBusy: Bool?
+    private var historyDatesNeedRefresh = false
+    private var dateFormattingObservers: [NSObjectProtocol] = []
+    private var historyViews: [UUID: HistoryRow] = [:]
+    private var emptyHistoryView: NSView?
+    private var renderedMenu: MenuState?
+    private var loginMenuItem: NSMenuItem?
+    private let historyDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    private struct HistoryRow {
+        var item: UIHistoryItem
+        let view: NSView
+        let title: NSTextField
+        let original: NSTextField
+        let detail: NSTextField
+        let undo: NSButton
+    }
+
+    private struct MenuState: Equatable {
+        let status: String
+        let isEnabled: Bool
+        let isPaused: Bool
+        let isBusy: Bool
+        let recent: [UIHistoryItem]
+    }
 
     init(actions: UIActions) {
         self.actions = actions
         super.init()
         buildWindow()
         update(state)
+        for name in [NSLocale.currentLocaleDidChangeNotification, NSNotification.Name.NSSystemTimeZoneDidChange] {
+            let observer = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.invalidateHistoryDateFormatting() }
+            }
+            dateFormattingObservers.append(observer)
+        }
+    }
+
+    deinit {
+        for observer in dateFormattingObservers { NotificationCenter.default.removeObserver(observer) }
     }
 
     func showWindow() {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        refreshVisibleRows()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) { refreshVisibleRows() }
+    func windowDidDeminiaturize(_ notification: Notification) { refreshVisibleRows() }
+    func menuWillOpen(_ menu: NSMenu) {
+        loginMenuItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
     func update(_ state: UIState) {
@@ -91,15 +140,53 @@ final class AppUI: NSObject {
         pauseButton.isEnabled = state.isEnabled
         retryButton.isEnabled = state.isEnabled && !state.isBusy && !state.isPaused
         clearButton.isEnabled = (!state.history.isEmpty || !state.previews.isEmpty) && !state.isBusy
-        rebuildPreviews()
-        rebuildHistory()
-        rebuildMenu()
+        refreshVisibleRows()
+        let menuState = MenuState(status: state.status, isEnabled: state.isEnabled,
+                                  isPaused: state.isPaused, isBusy: state.isBusy,
+                                  recent: Array(state.history.prefix(5)))
+        if menuState != renderedMenu {
+            rebuildMenu()
+            renderedMenu = menuState
+        }
+    }
+
+    /// Row trees are updated only when their pane can be seen. The latest state is
+    /// retained while the window is closed or its other pane is selected.
+    private func refreshVisibleRows() {
+        guard window.isVisible, !window.isMiniaturized else { return }
+        if !setupPane.isHidden, renderedPreviews != state.previews {
+            rebuildPreviews()
+            renderedPreviews = state.previews
+        }
+        if !historyPane.isHidden {
+            if renderedHistory != state.history {
+                updateHistory()
+                renderedHistory = state.history
+                renderedHistoryBusy = state.isBusy
+            } else if renderedHistoryBusy != state.isBusy {
+                updateUndoEnablement()
+                renderedHistoryBusy = state.isBusy
+            }
+            if historyDatesNeedRefresh {
+                for row in historyViews.values { row.detail.stringValue = historyDetail(row.item) }
+                historyDatesNeedRefresh = false
+            }
+        }
+    }
+
+    private func invalidateHistoryDateFormatting() {
+        historyDateFormatter.locale = .current
+        historyDateFormatter.calendar = .current
+        historyDateFormatter.timeZone = .current
+        historyDatesNeedRefresh = true
+        refreshVisibleRows()
     }
 
     private func buildWindow() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 740),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
+        window.delegate = self
         window.title = "Screenshot Renamer"
         window.minSize = NSSize(width: 650, height: 580)
         window.isReleasedWhenClosed = false
@@ -242,33 +329,77 @@ final class AppUI: NSObject {
         fillWidth(previewRows)
     }
 
-    private func rebuildHistory() {
-        removeRows(from: historyRows)
-        if state.history.isEmpty {
-            let empty = wrapping("No renames yet. Once automatic naming is enabled, recent screenshots and Undo actions appear here.", size: 13)
-            empty.textColor = .secondaryLabelColor
-            historyRows.addArrangedSubview(empty)
-        } else {
-            let formatter = DateFormatter()
-            formatter.dateStyle = .medium
-            formatter.timeStyle = .short
-            for item in state.history {
-                let title = wrapping(item.renamed, size: 13, weight: .medium)
-                let original = wrapping(item.original, size: 11)
-                original.textColor = .secondaryLabelColor
-                let detail = wrapping("\(formatter.string(from: item.date)) · \(item.state)", size: 11)
-                detail.textColor = .secondaryLabelColor
-                let text = vertical([title, original, detail], spacing: 5)
-                fillWidth(text)
-                let undo = button("Undo", #selector(undoButton(_:)))
-                undo.identifier = NSUserInterfaceItemIdentifier(item.id.uuidString)
-                undo.isEnabled = item.canUndo && !state.isBusy
-                let row = horizontal([text, undo], spacing: 14)
-                row.alignment = .centerY
-                historyRows.addArrangedSubview(card(row, inset: 14))
-            }
+    private func updateHistory() {
+        let retainedIDs = Set(state.history.map(\.id))
+        for id in Array(historyViews.keys) where !retainedIDs.contains(id) {
+            guard let row = historyViews.removeValue(forKey: id) else { continue }
+            historyRows.removeArrangedSubview(row.view)
+            row.view.removeFromSuperview()
         }
-        fillWidth(historyRows)
+        if state.history.isEmpty {
+            if emptyHistoryView == nil {
+                let empty = wrapping("No renames yet. Once automatic naming is enabled, recent screenshots and Undo actions appear here.", size: 13)
+                empty.textColor = .secondaryLabelColor
+                historyRows.addArrangedSubview(empty)
+                empty.widthAnchor.constraint(equalTo: historyRows.widthAnchor).isActive = true
+                emptyHistoryView = empty
+            }
+            return
+        }
+        if let empty = emptyHistoryView {
+            historyRows.removeArrangedSubview(empty)
+            empty.removeFromSuperview()
+            emptyHistoryView = nil
+        }
+        var currentRows = historyRows.arrangedSubviews
+        for (index, item) in state.history.enumerated() {
+            var row: HistoryRow
+            if let existing = historyViews[item.id] {
+                row = existing
+                if row.item != item {
+                    row.title.stringValue = item.renamed
+                    row.original.stringValue = item.original
+                    row.detail.stringValue = historyDetail(item)
+                    row.item = item
+                }
+            } else {
+                row = makeHistoryRow(item)
+                historyRows.insertArrangedSubview(row.view, at: index)
+                row.view.widthAnchor.constraint(equalTo: historyRows.widthAnchor).isActive = true
+                currentRows.insert(row.view, at: index)
+            }
+            row.undo.isEnabled = item.canUndo && !state.isBusy
+            if currentRows[index] !== row.view {
+                historyRows.removeArrangedSubview(row.view)
+                historyRows.insertArrangedSubview(row.view, at: index)
+                currentRows.removeAll { $0 === row.view }
+                currentRows.insert(row.view, at: index)
+            }
+            historyViews[item.id] = row
+        }
+    }
+
+    private func makeHistoryRow(_ item: UIHistoryItem) -> HistoryRow {
+        let title = wrapping(item.renamed, size: 13, weight: .medium)
+        let original = wrapping(item.original, size: 11)
+        original.textColor = .secondaryLabelColor
+        let detail = wrapping(historyDetail(item), size: 11)
+        detail.textColor = .secondaryLabelColor
+        let text = vertical([title, original, detail], spacing: 5)
+        fillWidth(text)
+        let undo = button("Undo", #selector(undoButton(_:)))
+        undo.identifier = NSUserInterfaceItemIdentifier(item.id.uuidString)
+        let content = horizontal([text, undo], spacing: 14)
+        let view = card(content, inset: 14)
+        return HistoryRow(item: item, view: view, title: title, original: original, detail: detail, undo: undo)
+    }
+
+    private func historyDetail(_ item: UIHistoryItem) -> String {
+        "\(historyDateFormatter.string(from: item.date)) · \(item.state)"
+    }
+
+    private func updateUndoEnablement() {
+        for row in historyViews.values { row.undo.isEnabled = row.item.canUndo && !state.isBusy }
     }
 
     private func rebuildMenu() {
@@ -282,6 +413,7 @@ final class AppUI: NSObject {
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Screenshot Renamer: \(state.status)")
         statusItem.button?.toolTip = "Screenshot Renamer — \(state.status)"
         let menu = NSMenu()
+        menu.delegate = self
         menu.autoenablesItems = false
         let heading = NSMenuItem(title: "Screenshot Renamer · \(state.status)", action: nil, keyEquivalent: "")
         heading.isEnabled = false
@@ -315,6 +447,7 @@ final class AppUI: NSObject {
         menu.addItem(.separator())
         let login = menuItem("Open at Login", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        loginMenuItem = login
         menu.addItem(login)
         menu.addItem(.separator())
         menu.addItem(menuItem("Quit Screenshot Renamer", #selector(quit), key: "q"))
@@ -338,6 +471,7 @@ final class AppUI: NSObject {
     @objc private func changePane() {
         setupPane.isHidden = segments.selectedSegment != 0
         historyPane.isHidden = segments.selectedSegment != 1
+        refreshVisibleRows()
     }
     @objc private func openSettings() { segments.selectedSegment = 0; changePane(); showWindow() }
     @objc private func openHistory() { segments.selectedSegment = 1; changePane(); showWindow() }
