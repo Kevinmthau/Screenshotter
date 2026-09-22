@@ -65,7 +65,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --scratch-pa
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/build-app.sh
 ```
 
-The app also supports `--integration-check REPORT_PATH`. This mode sends generated samples only and exercises rename/Undo on temporary copies, writes its report, and exits. Launch it from the installed bundle through LaunchServices to check the actual background-app environment:
+The app also supports `--integration-check REPORT_PATH`. This mode sends generated samples only and exercises rename/Undo on temporary copies, writes its report, and exits. The report succeeds only when every generated sample receives a useful name and passes both content-preservation checks. Failed checks retain available sample results and an error; report-write failures are printed to standard error. Launch it from the installed bundle through LaunchServices to check the actual background-app environment:
 
 ```sh
 open -n "$HOME/Applications/Screenshot Renamer.app" --args --integration-check "$HOME/Library/Logs/Screenshot Renamer Integration.json"

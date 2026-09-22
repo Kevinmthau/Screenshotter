@@ -25,39 +25,11 @@ import RenamerCore
     }
 
     private func integrationCheck(report: URL) async {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ScreenshotRenamer-Integration-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: directory) }
-        var result: [String: Any] = ["date": ISO8601DateFormatter().string(from: Date()), "bundle": Bundle.main.bundlePath,
-                                     "launch": "NSApplication via LaunchServices", "automaticNamingEnabled": false]
-        let analyzer = CodexAnalyzer()
-        switch await analyzer.checkAvailability() {
-        case .available(let executable): result["authentication"] = "available"; result["executable"] = executable.path
-        case .unavailable(let error): result["authentication"] = error.localizedDescription
-        }
         do {
-            let files = try SampleScreenshots.create(in: directory)
-            let renamer = try SafeFileRenamer(journalURL: directory.appendingPathComponent("journal.json"))
-            var previews: [[String: Any]] = []
-            for file in files {
-                let snapshot = try FileSnapshot.capture(at: file)
-                let started = Date()
-                let suggestion = try await analyzer.analyze(file)
-                let elapsed = Date().timeIntervalSince(started)
-                var preview: [String: Any] = ["sample": file.lastPathComponent, "title": suggestion.title, "useful": suggestion.useful, "seconds": elapsed]
-                if suggestion.useful {
-                    let entry = try renamer.rename(snapshot, title: suggestion.title, captureDate: Date())
-                    preview["renamed"] = entry.newURL.lastPathComponent
-                    preview["contentPreserved"] = try FileSnapshot.capture(at: entry.newURL).fingerprint == snapshot.fingerprint
-                    _ = try renamer.undo(entryID: entry.id)
-                    preview["undoPreserved"] = try FileSnapshot.capture(at: file).fingerprint == snapshot.fingerprint
-                }
-                previews.append(preview)
-                result["samples"] = previews
-                try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]).write(to: report, options: .atomic)
-            }
-            result["success"] = true
-        } catch { result["success"] = false; result["error"] = error.localizedDescription }
-        try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]).write(to: report, options: .atomic)
+            _ = try await IntegrationCheckRunner().run(reportURL: report, bundlePath: Bundle.main.bundlePath)
+        } catch {
+            fputs("Screenshot Renamer integration check: \(error.localizedDescription)\n", stderr)
+        }
     }
 }
 
