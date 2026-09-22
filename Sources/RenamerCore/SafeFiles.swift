@@ -341,6 +341,14 @@ public final class SafeFileRenamer {
         try save([])
     }
 
+    private func destinationExists(at url: URL) throws -> Bool {
+        var info = stat()
+        if url.path.withCString({ lstat($0, &info) }) == 0 { return true }
+        let code = errno
+        guard code == ENOENT else { throw SafeFileError.operation("Inspect destination", code) }
+        return false
+    }
+
     public func pruneHistory(now: Date = Date()) throws {
         try requireReady()
         let cutoff = now.addingTimeInterval(-30 * 24 * 60 * 60)
@@ -415,14 +423,6 @@ public final class SafeFileRenamer {
 
     private func removeEntry(id: UUID) throws {
         try save(history.filter { $0.id != id })
-    }
-
-    private func destinationExists(at url: URL) throws -> Bool {
-        var info = stat()
-        if url.path.withCString({ lstat($0, &info) }) == 0 { return true }
-        let code = errno
-        guard code == ENOENT else { throw SafeFileError.operation("Inspect destination", code) }
-        return false
     }
 
     private func verifiedExclusiveRename(from source: URL, to destination: URL, expected: FileSnapshot) throws {
