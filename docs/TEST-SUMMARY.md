@@ -1,4 +1,18 @@
-# Validation — September 21, 2026
+# Validation
+
+## September 22 connection fix
+
+Selecting `ChatGPT.app` or `Codex.app` through **Locate Codex…** now resolves the embedded `Contents/Resources/codex` executable. Previously saved app-bundle selections are also supported. Executable validation rejects directories, and clicking Preview before connecting Codex now displays an actionable message.
+
+The focused `CodexAnalyzerTests` run completed with **18 passed, 1 opt-in network case skipped, and 0 failures**, including a new regression covering app-bundle selections, direct executable selections, and invalid directories. Tests used full Xcode because the selected Command Line Tools did not provide XCTest:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --scratch-path /tmp/screenshot-renamer-xcode-tests --filter CodexAnalyzerTests
+```
+
+The release build and strict code-signature verification passed, and the updated app was installed and reopened. The bundled Codex CLI reported a valid saved ChatGPT login in a minimal environment. Live sample generation and the reopened UI were not verified for this update; the installed-app measurements below describe the earlier release.
+
+## September 21 validation
 
 Built and installed locally at `~/Applications/Screenshot Renamer.app` on this Apple Silicon Mac running macOS 27.0, using Swift 6.4 and a macOS 13 deployment target. The release archive is `dist/Screenshot Renamer.zip`. The installed bundle passed strict ad hoc code-signature verification. Building and staging in temporary folders avoids Finder metadata added by the synced Documents folder.
 

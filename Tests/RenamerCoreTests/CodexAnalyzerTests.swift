@@ -281,6 +281,18 @@ final class CodexAnalyzerTests: XCTestCase {
         }
     }
 
+    func testAppBundleOverrideResolvesEmbeddedCodexAndRejectsDirectories() throws {
+        let app = directory.appendingPathComponent("ChatGPT.app")
+        let embedded = app.appendingPathComponent("Contents/Resources/codex")
+        try FileManager.default.createDirectory(at: embedded.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let executable = try fakeCodex("exit 0")
+        try FileManager.default.copyItem(at: executable, to: embedded)
+        XCTAssertEqual(try CodexAnalyzer(executableOverride: app).resolveExecutable(), embedded)
+        XCTAssertEqual(try CodexAnalyzer(executableOverride: executable).resolveExecutable(), executable)
+        XCTAssertThrowsError(try CodexAnalyzer(executableOverride: directory).resolveExecutable())
+        XCTAssertThrowsError(try CodexAnalyzer(executableOverride: directory.appendingPathComponent("Missing.app")).resolveExecutable())
+    }
+
     func testMissingExecutableAndSignedOutStatus() async throws {
         let missing = await CodexAnalyzer(executableOverride: directory.appendingPathComponent("missing")).checkAvailability()
         XCTAssertEqual(missing, .unavailable(.unavailable))

@@ -159,13 +159,13 @@ private struct SavedSettings: Codable {
     private func chooseCodex() {
         guard !busy else { return }
         let panel = NSOpenPanel(); panel.title = "Locate the Codex CLI"
-        panel.message = "Choose the codex executable. The app otherwise checks standard install locations and installed Codex or ChatGPT apps."
+        panel.message = "Choose the codex executable, Codex.app, or ChatGPT.app."
         panel.canChooseDirectories = false; panel.canChooseFiles = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard FileManager.default.isExecutableFile(atPath: url.path) else {
-            attention = "Choose an executable Codex CLI file."; render(); return
+        guard let executable = try? CodexAnalyzer(executableOverride: url).resolveExecutable() else {
+            attention = "Choose a Codex CLI executable or a Codex or ChatGPT app containing it."; render(); return
         }
-        settings.executablePath = url.path; available = false; settings.previewCompleted = false
+        settings.executablePath = executable.path; available = false; settings.previewCompleted = false
         _ = persist(); checkCodex()
     }
 
@@ -190,7 +190,11 @@ private struct SavedSettings: Codable {
 
     /// Preview always uses synthetic images, never existing Desktop files.
     private func preview() {
-        guard available, !busy, !fatalPersistenceError, !isQuitting else { return }
+        guard !busy, !fatalPersistenceError, !isQuitting else { return }
+        guard available else {
+            attention = "Connect Codex using Check Connection before generating preview samples."
+            render(); return
+        }
         busy = true; previews = []; transientDetail = "Naming three generated samples. Their files will not be renamed."
         let client = analyzer
         render()

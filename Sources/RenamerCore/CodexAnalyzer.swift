@@ -153,13 +153,20 @@ public struct CodexAnalyzer: Sendable {
         return args
     }
 
-    func resolveExecutable() throws -> URL {
+    public func resolveExecutable() throws -> URL {
         let manager = FileManager.default
+        func isExecutableFile(_ url: URL) -> Bool {
+            var isDirectory: ObjCBool = false
+            return url.isFileURL && manager.fileExists(atPath: url.path, isDirectory: &isDirectory)
+                && !isDirectory.boolValue && manager.isExecutableFile(atPath: url.path)
+        }
         if let explicit = executableOverride {
-            guard explicit.isFileURL, manager.isExecutableFile(atPath: explicit.path) else {
+            let executable = explicit.pathExtension.lowercased() == "app"
+                ? explicit.appendingPathComponent("Contents/Resources/codex") : explicit
+            guard isExecutableFile(executable) else {
                 throw CodexAnalysisError.unavailable
             }
-            return explicit
+            return executable
         }
         var candidates = (sourceEnvironment["PATH"] ?? "").split(separator: ":")
             .filter { $0.hasPrefix("/") }
@@ -177,7 +184,7 @@ public struct CodexAnalyzer: Sendable {
                 candidates.append(applications.appendingPathComponent(name).appendingPathComponent("Contents/Resources/codex"))
             }
         }
-        guard let executable = candidates.first(where: { manager.isExecutableFile(atPath: $0.path) }) else {
+        guard let executable = candidates.first(where: isExecutableFile) else {
             throw CodexAnalysisError.unavailable
         }
         return executable
