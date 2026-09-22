@@ -213,6 +213,13 @@ public struct RenameJournalEntry: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// The two durability boundaries of an atomic journal replacement. Kept internal
+/// so failure recovery can be tested without replacing filesystem operations.
+struct JournalSynchronization {
+    var file: (Int32) -> Int32 = { Darwin.fsync($0) }
+    var directory: (Int32) -> Int32 = { Darwin.fsync($0) }
+}
+
 /// Call from one serial executor. The exclusive rename is atomic and never replaces a
 /// destination. Unix has no rename-if-source-inode-matches primitive: a different
 /// process can replace/edit the source between verification and rename. We verify
@@ -224,14 +231,20 @@ public final class SafeFileRenamer {
     public var requiresRecovery: Bool { recoveryRequired }
     private var recoveryRequired = false
     private var journalLockFD: Int32 = -1
+    private let journalSynchronization: JournalSynchronization
 
     private struct Journal: Codable {
         let version: Int
         let entries: [RenameJournalEntry]
     }
 
-    public init(journalURL: URL) throws {
+    public convenience init(journalURL: URL) throws {
+        try self.init(journalURL: journalURL, journalSynchronization: JournalSynchronization())
+    }
+
+    init(journalURL: URL, journalSynchronization: JournalSynchronization) throws {
         self.journalURL = journalURL.standardizedFileURL
+        self.journalSynchronization = journalSynchronization
         let parent = self.journalURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let lockURL = parent.appendingPathComponent(".\(self.journalURL.lastPathComponent).lock")
@@ -244,7 +257,12 @@ public final class SafeFileRenamer {
         journalLockFD = lockFD
         var journalInfo = stat()
         if self.journalURL.path.withCString({ lstat($0, &journalInfo) }) == 0 {
-            let fd = self.journalURL.path.withCString { Darwin.open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+            guard (journalInfo.st_mode & S_IFMT) == S_IFREG else {
+                throw SafeFileError.journal("history must be a regular file")
+            }
+            // A replacement between lstat and open must not turn startup into a
+            // blocking FIFO read. Validate the opened descriptor as well.
+            let fd = self.journalURL.path.withCString { Darwin.open($0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) }
             guard fd >= 0 else { throw SafeFileError.journal("the history file could not be opened safely") }
             var info = stat()
             guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
@@ -279,6 +297,9 @@ public final class SafeFileRenamer {
             let name = try FilenamePolicy.filename(title: title, captureDate: captureDate, originalExtension: snapshot.url.pathExtension,
                                                    collisionIndex: index, captureDay: captureDay)
             let destination = folder.appendingPathComponent(name, isDirectory: false)
+            // Avoid a durable transaction and another source hash for occupied
+            // names. RENAME_EXCL below still handles destinations created later.
+            if try destinationExists(at: destination) { continue }
             let intent = RenameJournalEntry(originalURL: snapshot.url, newURL: destination, snapshot: snapshot, state: .renameIntent)
             try save(history + [intent])
             do {
@@ -318,6 +339,14 @@ public final class SafeFileRenamer {
         try requireReady()
         try recoverInterruptedOperations()
         try save([])
+    }
+
+    private func destinationExists(at url: URL) throws -> Bool {
+        var info = stat()
+        if url.path.withCString({ lstat($0, &info) }) == 0 { return true }
+        let code = errno
+        guard code == ENOENT else { throw SafeFileError.operation("Inspect destination", code) }
+        return false
     }
 
     public func pruneHistory(now: Date = Date()) throws {
@@ -454,7 +483,7 @@ public final class SafeFileRenamer {
                 written += count
             }
         }
-        guard fsync(fd) == 0 else { throw SafeFileError.journal(String(cString: strerror(errno))) }
+        guard journalSynchronization.file(fd) == 0 else { throw SafeFileError.journal(String(cString: strerror(errno))) }
         // Replacing our journal is intentional. It never opens or writes through
         // a symlink and the temporary file is private to this process.
         let renamed = temp.path.withCString { from in journalURL.path.withCString { to in Darwin.rename(from, to) } }
@@ -462,7 +491,7 @@ public final class SafeFileRenamer {
         let directoryFD = parent.path.withCString { Darwin.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
         guard directoryFD >= 0 else { recoveryRequired = true; throw SafeFileError.journal("could not open history folder for synchronization") }
         defer { Darwin.close(directoryFD) }
-        guard fsync(directoryFD) == 0 else { recoveryRequired = true; throw SafeFileError.journal("could not synchronize history folder") }
+        guard journalSynchronization.directory(directoryFD) == 0 else { recoveryRequired = true; throw SafeFileError.journal("could not synchronize history folder") }
         history = entries
     }
 }
