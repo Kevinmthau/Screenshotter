@@ -67,6 +67,8 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
     private var renderedPreviews: [UIPreviewItem]?
     private var renderedHistory: [UIHistoryItem]?
     private var renderedHistoryBusy: Bool?
+    private var historyDatesNeedRefresh = false
+    private var dateFormattingObservers: [NSObjectProtocol] = []
     private var historyViews: [UUID: HistoryRow] = [:]
     private var emptyHistoryView: NSView?
     private var renderedMenu: MenuState?
@@ -100,6 +102,16 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         super.init()
         buildWindow()
         update(state)
+        for name in [NSLocale.currentLocaleDidChangeNotification, NSNotification.Name.NSSystemTimeZoneDidChange] {
+            let observer = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.invalidateHistoryDateFormatting() }
+            }
+            dateFormattingObservers.append(observer)
+        }
+    }
+
+    deinit {
+        for observer in dateFormattingObservers { NotificationCenter.default.removeObserver(observer) }
     }
 
     func showWindow() {
@@ -155,7 +167,19 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
                 updateUndoEnablement()
                 renderedHistoryBusy = state.isBusy
             }
+            if historyDatesNeedRefresh {
+                for row in historyViews.values { row.detail.stringValue = historyDetail(row.item) }
+                historyDatesNeedRefresh = false
+            }
         }
+    }
+
+    private func invalidateHistoryDateFormatting() {
+        historyDateFormatter.locale = .current
+        historyDateFormatter.calendar = .current
+        historyDateFormatter.timeZone = .current
+        historyDatesNeedRefresh = true
+        refreshVisibleRows()
     }
 
     private func buildWindow() {

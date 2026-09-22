@@ -53,6 +53,39 @@ private final class UIVerification {
         let originalRows = history.arrangedSubviews
         let originalButtons = try history.arrangedSubviews.map { try undoButton(in: $0) }
         let originalConstraints = history.constraints.count
+        let formatter: DateFormatter = try stored("historyDateFormatter", in: ui)
+        let expectedFormatter = DateFormatter()
+        expectedFormatter.dateStyle = .medium
+        expectedFormatter.timeStyle = .short
+        expectedFormatter.locale = .current
+        expectedFormatter.calendar = .current
+        expectedFormatter.timeZone = .current
+        // Simulate stale cached formatting without changing macOS or user preferences.
+        formatter.timeZone = TimeZone(secondsFromGMT: TimeZone.current.secondsFromGMT() == 0 ? 43200 : 0)
+        state.history[0].date.addTimeInterval(60)
+        ui.update(state)
+        let detail = try historyDetail(in: originalRows[0])
+        let expectedDate = "\(expectedFormatter.string(from: state.history[0].date)) · \(state.history[0].state)"
+        try check(detail.stringValue != expectedDate, "timezone fixture starts with stale cached date text")
+        NotificationCenter.default.post(name: .NSSystemTimeZoneDidChange, object: nil)
+        try check(detail.stringValue == expectedDate && history.arrangedSubviews[0] === originalRows[0],
+                  "timezone changes refresh visible dates without replacing rows")
+        formatter.locale = Locale(identifier: Locale.current.language.languageCode?.identifier == "fr" ? "en_US" : "fr_FR")
+        state.history[0].date.addTimeInterval(60)
+        ui.update(state)
+        let hiddenDate = detail.stringValue
+        try check(hiddenDate != "\(expectedFormatter.string(from: state.history[0].date)) · \(state.history[0].state)",
+                  "locale fixture starts with stale cached date text")
+        segments.selectedSegment = 0
+        segments.sendAction(segments.action!, to: segments.target)
+        NotificationCenter.default.post(name: NSLocale.currentLocaleDidChangeNotification, object: nil)
+        try check(detail.stringValue == hiddenDate, "locale changes defer hidden History date updates")
+        segments.selectedSegment = 1
+        segments.sendAction(segments.action!, to: segments.target)
+        try check(detail.stringValue == "\(expectedFormatter.string(from: state.history[0].date)) · \(state.history[0].state)" &&
+                  history.arrangedSubviews[0] === originalRows[0],
+                  "selecting History applies current locale to reused rows")
+        try check(previews.arrangedSubviews[0] === previewRow, "date-format changes preserve unrelated preview rows")
         for index in 0..<20 {
             state.isBusy = index.isMultiple(of: 2)
             state.detail = "Naming state \(index)"
@@ -144,6 +177,13 @@ private final class UIVerification {
 
     private func descendants(of view: NSView) -> [NSView] {
         [view] + view.subviews.flatMap { descendants(of: $0) }
+    }
+
+    private func historyDetail(in view: NSView) throws -> NSTextField {
+        guard let field = descendants(of: view).compactMap({ $0 as? NSTextField }).first(where: { $0.stringValue.contains(" · ") }) else {
+            throw VerificationFailure(description: "Missing history date label")
+        }
+        return field
     }
 
     private func undoButton(in view: NSView) throws -> NSButton {
