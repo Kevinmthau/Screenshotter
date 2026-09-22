@@ -1,0 +1,38 @@
+{
+  "authentication" : "available",
+  "automaticNamingEnabled" : false,
+  "bundle" : "\/Users\/kevinthau\/Applications\/Screenshot Renamer.app",
+  "date" : "2026-09-21T20:44:30Z",
+  "executable" : "\/Applications\/ChatGPT.app\/Contents\/Resources\/codex",
+  "launch" : "NSApplication via LaunchServices",
+  "samples" : [
+    {
+      "contentPreserved" : true,
+      "renamed" : "Flourish - On-Device AI Notes - 2026-09-21.png",
+      "sample" : "Screenshot 2026-09-21 at 10.01.00 AM.png",
+      "seconds" : 4.9604830741882324,
+      "title" : "Flourish - On-Device AI Notes",
+      "undoPreserved" : true,
+      "useful" : true
+    },
+    {
+      "contentPreserved" : true,
+      "renamed" : "Harbor - Monthly Spending Overview - 2026-09-21.png",
+      "sample" : "Screenshot 2026-09-21 at 10.02.00 AM.png",
+      "seconds" : 5.2089070081710815,
+      "title" : "Harbor - Monthly Spending Overview",
+      "undoPreserved" : true,
+      "useful" : true
+    },
+    {
+      "contentPreserved" : true,
+      "renamed" : "Atlas - Kyoto Weekend Itinerary - 2026-09-21.png",
+      "sample" : "Screenshot 2026-09-21 at 10.03.00 AM.png",
+      "seconds" : 4.6639961004257202,
+      "title" : "Atlas - Kyoto Weekend Itinerary",
+      "undoPreserved" : true,
+      "useful" : true
+    }
+  ],
+  "success" : true
+}
