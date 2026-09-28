@@ -347,8 +347,9 @@ private struct SavedSettings: Codable {
         }
         guard settings.enabled, let folder, let ledger = settings.ledger else { render(); return }
         // Maintenance and connection checks above run on every tick; only the timer's own scan
-        // backs off while idle.
-        guard periodicScans.shouldScan(periodic: periodic, watching: watcher != nil,
+        // backs off while idle. An unreadable folder recovers on its next successful scan, so it
+        // keeps the two-second cadence; each failed scan is cheap.
+        guard periodicScans.shouldScan(periodic: periodic, watching: watcher != nil && !folderUnreadable,
                                        pending: !ledger.pending.isEmpty) else { return }
         scans.request(folder)
     }
