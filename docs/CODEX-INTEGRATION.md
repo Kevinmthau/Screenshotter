@@ -1,6 +1,6 @@
 # Codex image integration
 
-Verified on this Mac on September 21, 2026. Only generated sample screens were submitted. No Desktop screenshot or other private image was opened or uploaded for these tests.
+Local automated checks were verified on this Mac on September 21, 2026. The live measurements, actual-CLI request audit, and installed-app authentication evidence below are earlier results from the same date; they predate subsequent review fixes and were not rerun for this cleanup. Only generated sample screens were submitted. No Desktop screenshot or other private image was opened or uploaded for these tests.
 
 The bridge discovers an explicit executable override, an executable on PATH, standard Homebrew locations, or the registered Codex/ChatGPT application through LaunchServices. Stable application-name fallbacks are included; version-specific application/cache paths are not required. The installed executable resolved to the ChatGPT application's bundled CLI.
 
@@ -17,7 +17,7 @@ Each analysis:
 
 The prompt treats all screenshot text as untrusted content. It asks for a short title such as `Flourish - On-Device AI Notes`, without dates, extensions, financial amounts, account identifiers, passwords, or unnecessary personal details. The application validates the JSON and title; its separate file-operation layer owns naming and renaming.
 
-## Live generated-sample results
+## Earlier live generated-sample results
 
 | Synthetic screen | Returned title | Analysis time |
 | --- | --- | --- |
@@ -27,11 +27,15 @@ The prompt treats all screenshot text as untrusted content. It asks for a short 
 
 Mean analysis time was 4.60 seconds. This includes process startup, normalization, the network request, and response validation; it excludes the watcher's save-stability delay. These are three local measurements, not a latency guarantee. The spending title omitted the fictional account and amount. The travel title ignored the embedded instruction.
 
-An actual CLI test with a newly created, empty authentication home returned `authenticationRequired` from both availability checking and image analysis. The user's saved login and configuration were not changed. Authentication in the final installed app's LaunchServices environment is checked separately by the application's background diagnostic.
+An actual CLI test with a newly created, empty authentication home returned `authenticationRequired` from both availability checking and image analysis. The user's saved login and configuration were not changed. The earlier installed-app LaunchServices authentication check is recorded separately in [the test summary](TEST-SUMMARY.md).
 
 ## Automated checks
 
-The 14 analyzer XCTest cases completed with zero failures: 13 local tests ran, and the opt-in live-network test was skipped during the normal test run. Coverage includes strict response validation, unsafe titles, environment filtering, model parsing, tool restrictions, successful response and temporary cleanup, sanitized authentication/quota/offline errors, missing CLI, timeout, process-group cancellation, bounded output, image/PDF preservation, and rejection of symlinks, FIFOs, directories, and oversized files. Quota and offline failures use controlled CLI responses rather than intentionally exhausting the user's quota or changing network settings.
+The 19 analyzer XCTest cases completed with zero failures: 18 local tests ran, and the opt-in live-network test was skipped during the normal test run. Coverage includes strict response validation, unsafe titles, environment filtering, model parsing, tool restrictions, successful response and temporary cleanup, sanitized authentication/quota/offline errors, missing CLI, timeout, process-group cancellation, connection-check shutdown and temporary cleanup, bounded output and ordered tails under output floods, deadlines and cancellation with descendant-held pipes, image/PDF preservation, and rejection of symlinks, FIFOs, directories, and oversized files. Quota and offline failures use controlled CLI responses rather than intentionally exhausting the user's quota or changing network settings.
+
+Four connection-check lifecycle tests verify stale-result rejection when the executable changes, serialized cancellation and cleanup, skipped superseded checks, and shutdown draining that prevents subsequent checks.
+
+Eight additional integration-report tests cover useful suggestions, rename/Undo content preservation, partial failure reporting, analyzer availability, empty sample sets, and report-write failures. These tests use controlled local analysis and do not submit images to the service.
 
 Run local tests using the full Xcode developer directory on this Mac:
 

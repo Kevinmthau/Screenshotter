@@ -1,26 +1,34 @@
 # Validation — September 21, 2026
 
-Built and installed locally at `~/Applications/Screenshot Renamer.app` on this Apple Silicon Mac running macOS 27.0, using Swift 6.4 and a macOS 13 deployment target. The release archive is `dist/Screenshot Renamer.zip`. The installed bundle passed strict ad hoc code-signature verification. Building and staging in temporary folders avoids Finder metadata added by the synced Documents folder.
+Local validation used this Apple Silicon Mac running macOS 27.0, Swift 6.4, and a macOS 13 deployment target. The current release archive, `dist/Screenshot Renamer.zip`, was rebuilt and its bundle passed strict ad hoc code-signature verification. An earlier build remains installed at `~/Applications/Screenshot Renamer.app`. Building and staging in temporary folders avoids Finder metadata added by the synced Documents folder. The installed-app and live-service evidence below predates subsequent review fixes and was not rerun for this cleanup.
 
 ## Automated and runtime results
 
-**65 XCTest cases: 64 passed, 1 opt-in network case skipped, 0 failures.** This includes 19 regression tests added for the review fixes. The skipped network scenario was exercised separately through live generated samples and the initial installed app; those installed-app measurements predate the review fixes.
+**101 XCTest cases: 100 passed, 1 opt-in network case skipped, 0 failures.** These local results include the pipeline, file-transaction, connection-check, and integration-report regressions below. Earlier live generated-sample and installed-app runs are recorded separately; they do not validate the current revision against the service.
 
 - Safe file operations: collisions, exclusive no-overwrite rename, byte preservation, exact extension preservation, changed contents (including same size and restored modification time), replacement identity, manual move/deletion, symlinks, occupied Undo destination, modified Undo source, concurrent journal instances, durable rename/Undo recovery, corrupt journal rejection, journal-write failure, 30-day pruning, and Clear History.
 - Eligibility and queue: activation baseline, old captures, manual names, non-image downloads, recordings, duplicate events, own renames, bounded capacity of 64, editor replacements, stability delay, pending recovery, moved originals with same-path replacements, retry scheduling, expired pending filenames, and late metadata rejection.
-- Codex bridge: strict JSON schema, unsafe names, configured-model parsing, environment isolation, login/quota/offline categories, bounded output, process-group cancellation, hard timeout, temporary cleanup, image-format preservation, and rejection of symlinks, nonregular files, and oversized sources.
+- Codex bridge: strict JSON schema, unsafe names, configured-model parsing, environment isolation, login/quota/offline categories, bounded output and ordered diagnostic tails under output floods, process-group cancellation, deadlines and cancellation when descendants keep output pipes open, temporary cleanup, image-format preservation, and rejection of symlinks, nonregular files, and oversized sources.
+- Connection checks: changing the executable discards stale success and failure results, replacements wait for prior cleanup, superseded queued checks never start, and shutdown drains every outstanding check and rejects new ones. A local CLI fixture verifies that stopping a check terminates its subprocess and removes its temporary directory.
 - Review regressions: excluded files cannot replace pending captures or reappear after renaming/restart; inaccessible files and folders preserve recovery intents until access returns; persisted and legacy queues preserve their capture day across timezone changes, including date fallback and filename collisions. Folder access is restored before startup recovery.
+- Capture pipeline: event bursts share a follow-up scan; stale folder and queue results cannot submit analysis; blocked file scans leave the main actor responsive; cached scans still detect edits and replacements; pause revokes queued renames; cancellation serializes with authorized mutations; stale scans preserve new captures; injected clocks verify bounded retries.
+- File transactions: occupied destinations share one transaction, newly created destinations still receive exclusive no-overwrite protection, journal sync failures retain recoverable intents, and FIFO/directory journals are rejected safely.
+- Integration reports: every sample must receive a useful name and preserve content through rename and Undo; failures retain partial results, unavailable analysis avoids submissions, empty sample sets fail, and an unwritable report is rejected before submitting images.
 
-**8 actual watcher checks passed across 9 FSEvents callback batches.** The harness used the production watcher, ledger, and safe renamer in an isolated temporary directory, with the main run loop running. It verified real creation events, the two-second stability interval, eligibility without an extra event, duplicate coalescing, manual rename/deletion cancellation, byte-preserving application renames without loops, and untouched baseline files. Test data was removed afterward.
+**8 actual watcher checks passed.** The harness used the production watcher, ledger, and safe renamer in an isolated temporary directory, with the main run loop running. It verified real creation events, the two-second stability interval, eligibility without an extra event, duplicate coalescing, manual rename/deletion cancellation, byte-preserving application renames without loops, and untouched baseline files. Test data was removed afterward.
+
+**27 UI checks passed.** The harness exercised the production AppKit UI with synthetic state, without model calls or changes to user settings. It verified deferred rendering for closed windows and hidden panels, row and menu reuse, stable constraints, Undo state and action identity, row updates and reordering, empty states, and locale/timezone date refreshes.
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --scratch-path /tmp/screenshot-renamer-tests
-./scripts/test-watcher.sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/test-watcher.sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/test-ui.sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/build-app.sh
 ```
 
-## Installed-app integration
+## Earlier installed-app integration
 
-The app was launched through LaunchServices from its installed location with `--integration-check`. Saved ChatGPT authentication and CLI discovery worked without a shell profile or this conversation. Three generated screens were analyzed, renamed in a temporary directory, and undone. All three preserved SHA-256 content fingerprints through both operations. See `installed-app-check.json` for the captured report.
+The earlier installed build was launched through LaunchServices with `--integration-check`. Saved ChatGPT authentication and CLI discovery worked without a shell profile or this conversation. Three generated screens were analyzed, renamed in a temporary directory, and undone. All three preserved SHA-256 content fingerprints through both operations. See `installed-app-check.json` for the captured report. This run predates the current integration-report regression coverage.
 
 | Generated screen | Final filename | Analysis latency |
 | --- | --- | --- |
@@ -36,7 +44,7 @@ The installed native interface was inspected through accessibility and screensho
 
 ## Practical limits and remaining user checks
 
-- The final release was run on this Mac, not on a separate macOS 13 machine. The deployment target and API availability are checked by compilation.
+- Validation was performed on this Mac, not on a separate macOS 13 machine. The deployment target and API availability are checked by compilation.
 - Actual login-session relaunch has not been tested because Open at Login was intentionally left off. The app uses Apple's `SMAppService.mainApp` mechanism; enable it only when desired.
 - English macOS screenshot names are supported in this first release. Customized or localized default filenames are conservatively excluded.
 - Pause and shutdown invalidate outstanding work before rename and cancel the local child process; already submitted images cannot be recalled. The child-process cancellation is tested, while active Desktop capture/pause/wake behavior remains a user acceptance check after enabling.

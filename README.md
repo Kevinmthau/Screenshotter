@@ -55,6 +55,7 @@ See [the test summary](docs/TEST-SUMMARY.md), [Codex integration evidence](docs/
 ```sh
 swift test --scratch-path /tmp/screenshot-renamer-tests
 ./scripts/test-watcher.sh
+./scripts/test-ui.sh
 ./scripts/build-app.sh
 ```
 
@@ -62,8 +63,12 @@ With full Xcode installed, the equivalent commands are:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --scratch-path /tmp/screenshot-renamer-tests
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/test-watcher.sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/test-ui.sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/build-app.sh
 ```
+
+The UI harness uses synthetic state to check the production AppKit interface without submitting images or changing user settings. The watcher harness uses an isolated temporary directory.
 
 The app also supports `--integration-check REPORT_PATH`. This mode sends generated samples only and exercises rename/Undo on temporary copies, writes its report, and exits. The report succeeds only when every generated sample receives a useful name and passes both content-preservation checks. Failed checks retain available sample results and an error; report-write failures are printed to standard error. Launch it from the installed bundle through LaunchServices to check the actual background-app environment:
 

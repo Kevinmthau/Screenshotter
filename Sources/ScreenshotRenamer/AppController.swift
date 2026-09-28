@@ -10,7 +10,6 @@ private struct ReviewSuggestion: Codable {
 
 private struct SavedSettings: Codable {
     var folderBookmark: Data?
-    var folderPath: String?
     var executablePath: String?
     var enabled = false
     var paused = false
@@ -40,7 +39,8 @@ private struct SavedSettings: Codable {
     private var folderScope = false
     private var work: Task<Void, Never>?
     private var busy = false
-    private var checking = false
+    private let connectionCheck = CodexConnectionCheck()
+    private var checking: Bool { connectionCheck.isChecking }
     private var available = false
     private var attention: String?
     private var codexStatus = "Checking saved Codex login…"
@@ -83,11 +83,7 @@ private struct SavedSettings: Codable {
             // Folder scope is restored before the background service recovers the journal.
         } catch {
             fatalPersistenceError = true
-            if case SafeFileError.recoveryRequired = error {
-                attention = "An interrupted rename could not be checked. Restore access to the screenshot folder and restart the app; rename history has been preserved."
-            } else {
-                attention = "Saved state or folder access could not be restored. Quit and check the local data folder before retrying."
-            }
+            attention = "Saved state or folder access could not be restored. Quit and check the local data folder before retrying."
         }
         ui = AppUI(actions: UIActions(
             chooseFolder: { [weak self] in self?.chooseFolder() },
@@ -149,7 +145,7 @@ private struct SavedSettings: Codable {
                 if previousScope { previousFolder?.stopAccessingSecurityScopedResource() }
             }
             folder = selected; folderScope = selected.startAccessingSecurityScopedResource()
-            settings.folderBookmark = bookmark; settings.folderPath = selected.path
+            settings.folderBookmark = bookmark
             settings.enabled = false; settings.paused = false; settings.ledger = nil
             attention = nil
             _ = persist(); render()
@@ -157,26 +153,24 @@ private struct SavedSettings: Codable {
     }
 
     private func chooseCodex() {
-        guard !busy else { return }
+        guard !busy, !isQuitting else { return }
         let panel = NSOpenPanel(); panel.title = "Locate the Codex CLI"
         panel.message = "Choose the codex executable. The app otherwise checks standard install locations and installed Codex or ChatGPT apps."
         panel.canChooseDirectories = false; panel.canChooseFiles = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard panel.runModal() == .OK, let url = panel.url, !busy, !isQuitting else { return }
         guard FileManager.default.isExecutableFile(atPath: url.path) else {
             attention = "Choose an executable Codex CLI file."; render(); return
         }
         settings.executablePath = url.path; available = false; settings.previewCompleted = false
-        _ = persist(); checkCodex()
+        _ = persist(); checkCodex(replacingCurrent: true)
     }
 
-    private func checkCodex() {
-        guard !checking, !busy, !isQuitting else { return }
-        checking = true; codexStatus = "Checking saved Codex login…"; render()
+    private func checkCodex(replacingCurrent: Bool = false) {
+        guard (!checking || replacingCurrent), !busy, !isQuitting else { return }
+        codexStatus = "Checking saved Codex login…"
         let client = analyzer
-        Task { [weak self] in
-            let result = await client.checkAvailability()
-            guard let self else { return }
-            self.checking = false
+        connectionCheck.start(check: { await client.checkAvailability() }) { [weak self] result in
+            guard let self, !self.isQuitting else { return }
             switch result {
             case .available:
                 self.available = true; self.codexStatus = "Codex is available · saved login verified"
@@ -186,6 +180,7 @@ private struct SavedSettings: Codable {
             }
             self.render(); self.tick()
         }
+        render()
     }
 
     /// Preview always uses synthetic images, never existing Desktop files.
@@ -506,6 +501,7 @@ private struct SavedSettings: Codable {
         generation += 1; mutationAuthorization?.cancel(); work?.cancel(); scans.invalidate(); watcher?.stop(); timer?.invalidate()
         _ = persist()
         // Allow the CLI cancellation handler to terminate its child and clean temporary files.
+        await connectionCheck.stop()
         await work?.value
         await initialization?.value
         await maintenance?.value
