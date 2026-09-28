@@ -23,6 +23,7 @@ private struct SavedSettings: Codable {
 
 @MainActor final class AppController {
     private var ui: AppUI!
+    private let updater: AppUpdater?
     private var settings = SavedSettings()
     private let support: URL
     private let settingsURL: URL
@@ -43,7 +44,8 @@ private struct SavedSettings: Codable {
     private var folderScope = false
     private var work: Task<Void, Never>?
     private var busy = false
-    private var checking = false
+    private let connectionCheck = CodexConnectionCheck()
+    private var checking: Bool { connectionCheck.isChecking }
     private var available = false
     private var attention: String?
     private var folderUnreadable = false
@@ -69,7 +71,8 @@ private struct SavedSettings: Codable {
     private var lastHistoryEntries: [RenameJournalEntry] = []
     private var historyPresentation: [UIHistoryItem] = []
 
-    init() {
+    init(updater: AppUpdater? = nil) {
+        self.updater = updater
         support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Screenshot Renamer", isDirectory: true)
         settingsURL = support.appendingPathComponent("settings.json")
@@ -100,11 +103,7 @@ private struct SavedSettings: Codable {
             // Folder scope is restored before the background service recovers the journal.
         } catch {
             fatalPersistenceError = true
-            if case SafeFileError.recoveryRequired = error {
-                attention = "An interrupted rename could not be checked. Restore access to the screenshot folder and restart the app; rename history has been preserved."
-            } else {
-                attention = "Saved state or folder access could not be restored. Quit and check the local data folder before retrying."
-            }
+            attention = "Saved state or folder access could not be restored. Quit and check the local data folder before retrying."
         }
         ui = AppUI(actions: UIActions(
             chooseFolder: { [weak self] in self?.chooseFolder() },
@@ -116,8 +115,11 @@ private struct SavedSettings: Codable {
             clearHistory: { [weak self] in self?.clearHistory() },
             checkCodex: { [weak self] in self?.checkCodex() },
             chooseCodex: { [weak self] in self?.chooseCodex() },
+            checkForUpdates: { [weak updater] in updater?.checkForUpdates() },
+            toggleAutomaticUpdates: { [weak updater] in updater?.toggleAutomaticChecks() },
             quit: { [weak self] in self?.quit() }
         ))
+        updater?.stateChanged = { [weak self] _ in self?.render() }
         initialization = Task { [weak self] in
             guard let self else { return }
             defer { self.initialization = nil }
@@ -190,26 +192,24 @@ private struct SavedSettings: Codable {
     }
 
     private func chooseCodex() {
-        guard !busy else { return }
+        guard !busy, !isQuitting else { return }
         let panel = NSOpenPanel(); panel.title = "Locate the Codex CLI"
         panel.message = "Choose the codex executable, Codex.app, or ChatGPT.app."
         panel.canChooseDirectories = false; panel.canChooseFiles = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard panel.runModal() == .OK, let url = panel.url, !busy, !isQuitting else { return }
         guard let executable = try? CodexAnalyzer(executableOverride: url).resolveExecutable() else {
             attention = "Choose a Codex CLI executable or a Codex or ChatGPT app containing it."; render(); return
         }
         settings.executablePath = executable.path; available = false; settings.previewCompleted = false
-        _ = persist(); checkCodex()
+        _ = persist(); checkCodex(replacingCurrent: true)
     }
 
-    private func checkCodex() {
-        guard !checking, !busy, !isQuitting else { return }
-        checking = true; codexStatus = "Checking saved Codex login…"; render()
+    private func checkCodex(replacingCurrent: Bool = false) {
+        guard (!checking || replacingCurrent), !busy, !isQuitting else { return }
+        codexStatus = "Checking saved Codex login…"
         let client = analyzer
-        Task { [weak self] in
-            let result = await client.checkAvailability()
-            guard let self else { return }
-            self.checking = false
+        connectionCheck.start(check: { await client.checkAvailability() }) { [weak self] result in
+            guard let self, !self.isQuitting else { return }
             switch result {
             case .available:
                 self.available = true; self.codexStatus = "Codex is available · saved login verified"
@@ -221,6 +221,7 @@ private struct SavedSettings: Codable {
             }
             self.render(); self.tick()
         }
+        render()
     }
 
     /// Stops new submissions and schedules a connection check: within seconds after a slow or
@@ -606,15 +607,12 @@ private struct SavedSettings: Codable {
         let state = UIState(status: status, detail: detail, folder: folder?.path, codexStatus: codexStatus,
                           isEnabled: settings.enabled, isPaused: settings.paused, isBusy: busy || (checking && connectionIssue == nil),
                           canEnable: settings.previewCompleted && available && folder != nil && renamer != nil && !fatalPersistenceError,
-                          history: history, previews: previews + suggestions)
+                          history: history, previews: previews + suggestions, updates: updater?.state ?? UIUpdateState())
         if state != lastRendered { ui.update(state); lastRendered = state }
     }
 
     private func quit() {
-        Task { [weak self] in
-            await self?.stop()
-            NSApplication.shared.terminate(nil)
-        }
+        NSApplication.shared.terminate(nil)
     }
 
     func stop() async {
@@ -623,6 +621,7 @@ private struct SavedSettings: Codable {
         network.cancel()
         _ = persist()
         // Allow the CLI cancellation handler to terminate its child and clean temporary files.
+        await connectionCheck.stop()
         await work?.value
         await initialization?.value
         await maintenance?.value

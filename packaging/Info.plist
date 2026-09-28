@@ -10,8 +10,16 @@
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>Screenshot Renamer</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.0.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>1.1.0</string>
+    <key>CFBundleVersion</key><string>2</string>
+    <key>SUFeedURL</key><string>https://github.com/Kevinmthau/Screenshotter/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key><string>U0jGztvgXh5Vdur7QOIlwCwm7FSivXegqN7bp89oJpE=</string>
+    <key>SURequireSignedFeed</key><true/>
+    <key>SUVerifyUpdateBeforeExtraction</key><true/>
+    <key>SUEnableAutomaticChecks</key><true/>
+    <key>SUAutomaticallyUpdate</key><false/>
+    <key>SUScheduledCheckInterval</key><integer>86400</integer>
+    <key>SUSendProfileInfo</key><false/>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSDesktopFolderUsageDescription</key><string>Screenshot Renamer watches the Desktop folder you select and renames new screenshots after you enable automatic naming.</string>

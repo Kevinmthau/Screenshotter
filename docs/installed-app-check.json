@@ -1,7 +1,7 @@
 {
   "authentication" : "available",
   "automaticNamingEnabled" : false,
-  "bundle" : "\/Users\/kevinthau\/Applications\/Screenshot Renamer.app",
+  "bundle" : "~/Applications/Screenshot Renamer.app",
   "date" : "2026-09-21T20:44:30Z",
   "executable" : "\/Applications\/ChatGPT.app\/Contents\/Resources\/codex",
   "launch" : "NSApplication via LaunchServices",

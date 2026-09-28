@@ -11,13 +11,17 @@ private struct VerificationFailure: Error, CustomStringConvertible {
 private final class UIVerification {
     private var checks = 0
     private var undone: UUID?
+    private var updateChecks = 0
+    private var updateToggles = 0
 
     func run() throws {
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.prohibited)
         let ui = AppUI(actions: UIActions(chooseFolder: {}, preview: {}, enable: {}, togglePause: {}, retry: {},
                                           undo: { [weak self] in self?.undone = $0 }, clearHistory: {},
-                                          checkCodex: {}, chooseCodex: {}, quit: {}))
+                                          checkCodex: {}, chooseCodex: {},
+                                          checkForUpdates: { [weak self] in self?.updateChecks += 1 },
+                                          toggleAutomaticUpdates: { [weak self] in self?.updateToggles += 1 }, quit: {}))
         // Read the view references without adding a test-only API to AppUI.
         let window: NSWindow = try stored("window", in: ui)
         let history: NSStackView = try stored("historyRows", in: ui)
@@ -46,6 +50,36 @@ private final class UIVerification {
         ui.update(state)
         try check(previews.arrangedSubviews[0] === previewRow && statusItem.menu === menu,
                   "detail updates preserve preview rows and the menu")
+
+        try check(statusItem.menu?.item(withTitle: "Check for Updates…")?.isEnabled == false,
+                  "updater controls stay disabled when no updater is running")
+        state.updates = UIUpdateState(isAvailable: true, canCheck: true, automaticallyChecks: true)
+        ui.update(state)
+        try check(statusItem.menu?.item(withTitle: "Check for Updates…")?.isEnabled == true &&
+                  statusItem.menu?.item(withTitle: "Automatically Check for Updates")?.state == .on,
+                  "updater-only changes refresh menu enablement and automatic-check preference")
+        if let updateMenu = statusItem.menu, let item = updateMenu.item(withTitle: "Check for Updates…") {
+            updateMenu.performActionForItem(at: updateMenu.index(of: item))
+        }
+        if let updateMenu = statusItem.menu, let item = updateMenu.item(withTitle: "Automatically Check for Updates") {
+            updateMenu.performActionForItem(at: updateMenu.index(of: item))
+        }
+        try check(updateChecks == 1 && updateToggles == 1, "updater menu actions reach their injected handlers")
+        state.updates.canCheck = false
+        state.updates.automaticallyChecks = false
+        ui.update(state)
+        try check(statusItem.menu?.item(withTitle: "Check for Updates…")?.isEnabled == false &&
+                  statusItem.menu?.item(withTitle: "Automatically Check for Updates")?.state == .off,
+                  "an active update check disables rechecking without stale menu state")
+        state.updates.canCheck = true
+        state.updates.availableVersion = "1.1.0"
+        ui.update(state)
+        try check(statusItem.menu?.item(withTitle: "Update Available (1.1.0)…")?.isEnabled == true,
+                  "a scheduled update remains discoverable in the menu")
+        state.updates.availableVersion = nil
+        ui.update(state)
+        try check(statusItem.menu?.item(withTitle: "Check for Updates…") != nil,
+                  "finishing an update restores the normal check action")
 
         segments.selectedSegment = 1
         segments.sendAction(segments.action!, to: segments.target)

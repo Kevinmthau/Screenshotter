@@ -301,6 +301,37 @@ final class CodexAnalyzerTests: XCTestCase {
         XCTAssertEqual(availability, .unavailable(.authenticationRequired))
     }
 
+    @MainActor
+    func testStoppingConnectionCheckTerminatesCLIAndCleansTemporaryDirectory() async throws {
+        let marker = directory.appendingPathComponent("connection-check")
+        let workingDirectory = marker.appendingPathExtension("directory")
+        let executable = directory.appendingPathComponent("slow-availability")
+        try """
+        #!/bin/sh
+        /bin/pwd > \(quote(workingDirectory.path))
+        printf '%s' "$$" > \(quote(marker.path))
+        exec /bin/sleep 20
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let analyzer = CodexAnalyzer(executableOverride: executable)
+        let connection = CodexConnectionCheck()
+        var receivedResult = false
+        connection.start(check: { await analyzer.checkAvailability() }, receive: { _ in receivedResult = true })
+        var child: pid_t?
+        for _ in 0..<100 {
+            if let recorded = fixturePID(marker) { child = recorded; break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let start = Date()
+        await connection.stop()
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1)
+        XCTAssertFalse(connection.isChecking)
+        XCTAssertFalse(receivedResult)
+        XCTAssertEqual(kill(try XCTUnwrap(child), 0), -1)
+        let path = try String(contentsOf: workingDirectory).trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+    }
+
     func testLiveGeneratedSamplesWhenExplicitlyEnabled() async throws {
         guard ProcessInfo.processInfo.environment["SCREENSHOT_RENAMER_LIVE_TESTS"] == "1" else {
             throw XCTSkip("Set SCREENSHOT_RENAMER_LIVE_TESTS=1 to submit generated samples with your saved Codex login.")
