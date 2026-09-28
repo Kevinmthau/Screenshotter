@@ -9,9 +9,22 @@ The combined reliability, connection-check, and Sparkle updater changes passed `
 - **34 AppKit UI checks passed**, including 7 new checks for menu and window update controls.
 - The **universal arm64 + x86_64 app build passed**, including deep, strict code-signature verification of the app and its nested code.
 
-The earlier updater suite and packaging also passed on [GitHub's macOS 15 runner with Xcode 16.4](https://github.com/Kevinmthau/Screenshotter/actions/runs/36493354000). This caught and fixed an older-SDK compile failure in the subprocess working-directory setup.
+The final suite and packaging also passed on [GitHub's macOS 15 runner with Xcode 16.4](https://github.com/Kevinmthau/Screenshotter/actions/runs/36494546692). An earlier CI run caught and fixed an older-SDK compile failure in the subprocess working-directory setup.
 
-These results validate the combined source, local harnesses, and packaged app. An actual Sparkle download and installation from a hosted feed has not yet been tested end to end. The September 21 installed-app and live-service evidence below is historical and does not validate the updater.
+### Hosted release and installed update
+
+[Version 1.1.0, build 2](https://github.com/Kevinmthau/Screenshotter/releases/tag/v1.1.0) was published from commit `1af3ca614f802c367c16fcafbfa5f1113b19fc42`. All five release assets download without authentication. The stable feed matches the versioned feed; archive checksums, packaged revision, release metadata, and Git tag agree. Both the feed and archive signatures verified. A separate signing smoke test rejected a modified feed.
+
+An actual Sparkle update completed on this Mac:
+
+- Preserved the previous app archive and installed a local bootstrap build numbered 1.0.99, build 1, using the same feed and public key. This test build was never published.
+- **Check for Updates…** discovered hosted version 1.1.0 and displayed its release notes.
+- **Install Update**, then **Install and Relaunch**, downloaded the archive, replaced the app, and relaunched it successfully.
+- The installed app reported version 1.1.0, build 2, and the exact release revision. Deep, strict verification passed for the installed app and nested code.
+- The chosen folder, automatic naming state, and generated preview results were restored. The app returned to **Watching · 0 pending** with **Codex is available · saved login verified**. Canonical JSON fingerprints confirmed unchanged history; settings are rewritten during normal startup and were checked through the restored UI state.
+- A second update check reported **You’re up to date! Screenshot Renamer 1.1.0 is currently the newest version available.**
+
+These checks submitted no new model requests. They establish hosted download, installation, relaunch, and local CLI discovery on this Mac; they do not establish first-download Gatekeeper approval on another Mac or model naming quality for this revision. The app is ad hoc code-signed and not Apple Developer ID signed or notarized. The September 21 live-service evidence below remains historical.
 
 ## September 28 reliability update
 
