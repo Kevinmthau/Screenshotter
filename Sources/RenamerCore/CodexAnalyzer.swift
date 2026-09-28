@@ -21,8 +21,8 @@ public enum CodexAnalysisError: String, Error, LocalizedError, Equatable, Sendab
 
     public var errorDescription: String? {
         switch self {
-        case .authenticationRequired: return "Sign in to Codex, then retry pending screenshots."
-        case .quotaExceeded: return "Codex usage is unavailable. Check your usage, then retry."
+        case .authenticationRequired: return "Sign in to Codex to continue."
+        case .quotaExceeded: return "Codex usage is unavailable right now."
         case .offline: return "Codex could not connect. Your screenshot keeps its original name."
         case .transientFailure: return "Codex could not finish this request. Please retry."
         case .unavailable: return "A compatible Codex CLI is required. Install or update Codex, then check again."
@@ -60,6 +60,10 @@ public struct CodexAnalyzer: Sendable {
         self.sourceEnvironment = environment
     }
 
+    /// Login items start while the Mac is still busy, and the first launch of a large CLI
+    /// after startup can take several seconds.
+    static let availabilityTimeout: TimeInterval = 30
+
     public func checkAvailability() async -> CodexAvailability {
         do {
             let executable = try resolveExecutable()
@@ -68,7 +72,7 @@ public struct CodexAnalyzer: Sendable {
             let environment = safeEnvironment(temporaryDirectory: directory)
             let help = try await CLIProcess.run(executable: executable,
                 arguments: ["exec", "--help"], environment: environment,
-                directory: directory, timeout: 10)
+                directory: directory, timeout: Self.availabilityTimeout)
             guard help.status == 0,
                   ["--image", "--output-schema", "--output-last-message", "--ephemeral",
                    "--ignore-user-config", "--ignore-rules"].allSatisfy(help.output.contains) else {
@@ -76,7 +80,7 @@ public struct CodexAnalyzer: Sendable {
             }
             let login = try await CLIProcess.run(executable: executable,
                 arguments: ["login", "status"], environment: environment,
-                directory: directory, timeout: 10)
+                directory: directory, timeout: Self.availabilityTimeout)
             guard login.status == 0 else { return .unavailable(.authenticationRequired) }
             return .available(executable: executable)
         } catch let error as CodexAnalysisError {

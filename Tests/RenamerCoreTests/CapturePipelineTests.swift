@@ -245,13 +245,13 @@ final class CapturePipelineTests: XCTestCase {
         var job = try XCTUnwrap(policy.claim(from: &ledger))
         XCTAssertEqual(job.state, .analyzing)
         XCTAssertNil(policy.claim(from: &ledger))
-        XCTAssertTrue(policy.fail(&job, with: .offline))
+        XCTAssertEqual(policy.fail(&job, with: .offline), .retryScheduled)
         XCTAssertEqual(job.nextAttempt, now.addingTimeInterval(15))
         job.attempts = 2
-        XCTAssertTrue(policy.fail(&job, with: .timedOut))
+        XCTAssertEqual(policy.fail(&job, with: .timedOut), .retryScheduled)
         XCTAssertEqual(job.nextAttempt, now.addingTimeInterval(60))
-        job.attempts = 3
-        XCTAssertFalse(policy.fail(&job, with: .offline))
+        job.attempts = CaptureQueuePolicy.maximumAttempts
+        XCTAssertEqual(policy.fail(&job, with: .offline), .failed)
         XCTAssertEqual(job.state, .failed)
         ledger.update(job)
         policy.reset(job.id, in: &ledger)
