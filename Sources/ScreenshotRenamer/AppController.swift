@@ -36,6 +36,7 @@ private struct SavedSettings: Codable {
     private var initialization: Task<Void, Never>?
     private var watcher: DirectoryWatcher?
     private var timer: Timer?
+    private var periodicScans = PeriodicScanPolicy()
     private var folder: URL?
     private var folderScope = false
     private var work: Task<Void, Never>?
@@ -116,7 +117,7 @@ private struct SavedSettings: Codable {
             }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+            MainActor.assumeIsolated { self?.tick(periodic: true) }
         }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.tick() }
@@ -249,7 +250,8 @@ private struct SavedSettings: Codable {
 
     private func startWatching() {
         guard let folder else { return }
-        watcher?.stop()
+        // A watcher that failed to restart must read as missing, keeping two-second reconciliation.
+        watcher?.stop(); watcher = nil
         do { watcher = try DirectoryWatcher(url: folder) { [weak self] in self?.tick() } }
         catch { attention = "Filesystem notifications could not start. Folder reconciliation will continue every two seconds." }
     }
@@ -268,7 +270,7 @@ private struct SavedSettings: Codable {
         if available { tick() } else { checkCodex() }
     }
 
-    private func tick() {
+    private func tick(periodic: Bool = false) {
         guard !fatalPersistenceError, !isQuitting, renamer != nil else { return }
         if Date().timeIntervalSince(lastPruned) > 3600, maintenance == nil {
             maintenance = Task { [weak self] in
@@ -283,7 +285,10 @@ private struct SavedSettings: Codable {
                 _ = self.persist(); self.render()
             }
         }
-        guard settings.enabled, let folder, settings.ledger != nil else { render(); return }
+        guard settings.enabled, let folder, let ledger = settings.ledger else { render(); return }
+        // Maintenance above runs on every tick; only the timer's own scan backs off while idle.
+        guard periodicScans.shouldScan(periodic: periodic, watching: watcher != nil,
+                                       pending: !ledger.pending.isEmpty) else { return }
         scans.request(folder)
     }
 

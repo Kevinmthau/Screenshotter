@@ -40,6 +40,23 @@ import Foundation
     public func drain() async { await work?.value }
 }
 
+/// FSEvents request a scan for every change, so with the watcher running and nothing pending
+/// the timer is only a safety net. Pending captures keep the two-second cadence that stability
+/// and retry timing depend on, as does a folder without a watcher.
+public struct PeriodicScanPolicy: Sendable {
+    public static let idleInterval: TimeInterval = 30
+    private var lastScan = Date.distantPast
+    public init() {}
+
+    /// Change, wake, resume and retry requests always scan and restart the idle interval.
+    /// A clock set back ends the interval rather than suspending the safety net.
+    public mutating func shouldScan(periodic: Bool, watching: Bool, pending: Bool, now: Date = Date()) -> Bool {
+        if periodic, watching, !pending, (0..<Self.idleInterval).contains(now.timeIntervalSince(lastScan)) { return false }
+        lastScan = now
+        return true
+    }
+}
+
 /// Queue policy is independent of AppKit and wall-clock time. The controller owns
 /// persistence; these transitions are also used by deterministic retry/pause tests.
 public struct CaptureQueuePolicy: Sendable {

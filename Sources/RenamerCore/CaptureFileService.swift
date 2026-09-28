@@ -99,26 +99,45 @@ public final class CaptureFileService: @unchecked Sendable {
     }
 }
 
-/// Cache only filename-derived values. Re-read identity, revision and Spotlight eligibility
-/// on every scan, including late metadata rejection and editor replacements.
+/// Cache filename-derived values, and Spotlight answers once definite. Identity and revision
+/// are re-read on every scan. A cached answer applies only to the same identity and revision,
+/// whose ctime also changes with extended attributes. Unknown answers are re-read on every
+/// scan, so late metadata rejection and editor replacements are still observed.
 struct CaptureDirectoryScanner {
     private struct CachedName {
         let created: Date
         let candidate: Bool
         let captureDate: Date
     }
+    private struct CachedMetadata {
+        let revision: String
+        let isScreenCapture: Bool
+    }
     private var cachedNames: [String: CachedName] = [:]
+    private var cachedMetadata: [String: CachedMetadata] = [:]
     private var cachedDirectory: URL?
     private var cachedTimeZone = TimeZone.current
+    private let screenCaptureMetadata: (URL) -> Bool?
+
+    init(screenCaptureMetadata: @escaping (URL) -> Bool? = CaptureDirectoryScanner.spotlightScreenCapture) {
+        self.screenCaptureMetadata = screenCaptureMetadata
+    }
+
+    static func spotlightScreenCapture(_ url: URL) -> Bool? {
+        guard let item = MDItemCreate(nil, url.path as CFString) else { return nil }
+        return (MDItemCopyAttribute(item, "kMDItemIsScreenCapture" as CFString) as? NSNumber)?.boolValue
+    }
 
     mutating func observations(in directory: URL) throws -> [CaptureObservation] {
         if cachedDirectory != directory || cachedTimeZone != .current {
             cachedNames.removeAll()
+            cachedMetadata.removeAll()
             cachedDirectory = directory
             cachedTimeZone = .current
         }
         let urls = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
         var retained: [String: CachedName] = [:]
+        var retainedMetadata: [String: CachedMetadata] = [:]
         let files = urls.compactMap { url -> CaptureObservation? in
             var info = stat()
             guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return nil }
@@ -134,13 +153,16 @@ struct CaptureDirectoryScanner {
             }
             retained[name] = cached
             var metadata: Bool?
-            if cached.candidate, let item = MDItemCreate(nil, url.path as CFString) {
-                metadata = (MDItemCopyAttribute(item, "kMDItemIsScreenCapture" as CFString) as? NSNumber)?.boolValue
+            if cached.candidate {
+                if let previous = cachedMetadata[identity], previous.revision == revision { metadata = previous.isScreenCapture }
+                else { metadata = screenCaptureMetadata(url) }
+                if let metadata { retainedMetadata[identity] = CachedMetadata(revision: revision, isScreenCapture: metadata) }
             }
             return CaptureObservation(name: name, identity: identity, revision: revision, created: created,
                                       captureDate: cached.captureDate, eligible: cached.candidate && metadata != false)
         }
         cachedNames = retained
+        cachedMetadata = retainedMetadata
         return files
     }
 }
