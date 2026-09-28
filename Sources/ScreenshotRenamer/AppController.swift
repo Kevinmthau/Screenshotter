@@ -1,4 +1,5 @@
 import AppKit
+import Network
 import RenamerCore
 
 private struct ReviewSuggestion: Codable {
@@ -10,6 +11,7 @@ private struct ReviewSuggestion: Codable {
 
 private struct SavedSettings: Codable {
     var folderBookmark: Data?
+    var folderPath: String?
     var executablePath: String?
     var enabled = false
     var paused = false
@@ -29,12 +31,14 @@ private struct SavedSettings: Codable {
     private var queuePolicy = CaptureQueuePolicy()
     private var activeCapture: PendingCapture?
     private var mutationAuthorization: FileMutationAuthorization?
-    private lazy var scans = CaptureScanScheduler(scan: { [files] in try await files.observations(in: $0) },
-                                                  receive: { [weak self] in self?.receivedScan($0) })
+    private lazy var scans = CaptureScanScheduler(scan: { [weak self, files] in
+        try await files.observations(in: $0, freshMetadata: self?.pendingNames ?? [])
+    }, receive: { [weak self] in self?.receivedScan($0) })
     private var maintenance: Task<Void, Never>?
     private var initialization: Task<Void, Never>?
     private var watcher: DirectoryWatcher?
     private var timer: Timer?
+    private var periodicScans = PeriodicScanPolicy()
     private var folder: URL?
     private var folderScope = false
     private var work: Task<Void, Never>?
@@ -43,7 +47,17 @@ private struct SavedSettings: Codable {
     private var checking: Bool { connectionCheck.isChecking }
     private var available = false
     private var attention: String?
+    private var folderUnreadable = false
     private var codexStatus = "Checking saved Codex login…"
+    // Set while Codex is unavailable. Checks are local and never submit an image.
+    private var connectionIssue: CodexAnalysisError?
+    // A check cannot confirm a problem reported by naming (a revoked login, a missing
+    // model, a usage limit) is resolved; only a successful naming can.
+    private var connectionIssueFromNaming = false
+    private var connectionFailures = 0
+    private var nextConnectionCheck: Date?
+    private let network = NWPathMonitor()
+    private var networkReachable = true
     private var generation = 0
     private var overflow = false
     private var fatalPersistenceError = false
@@ -71,12 +85,16 @@ private struct SavedSettings: Codable {
             settings.ledger?.prunePending(before: Date().addingTimeInterval(-30 * 86400))
             settings.ledger?.recoverAfterRestart()
             if let bookmark = settings.folderBookmark {
-                do {
-                    var stale = false
-                    let resolved = try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope], bookmarkDataIsStale: &stale)
+                var stale = false
+                if let resolved = try? URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope], bookmarkDataIsStale: &stale) {
                     folder = resolved; folderScope = resolved.startAccessingSecurityScopedResource()
-                    if stale { settings.folderBookmark = try resolved.bookmarkData(options: [.withSecurityScope]) }
-                } catch {
+                    if stale, let refreshed = try? resolved.bookmarkData(options: [.withSecurityScope]) { settings.folderBookmark = refreshed }
+                } else if let saved = AppController.savedFolder(atPath: settings.folderPath) {
+                    // Each ad hoc build has a new code signature, which can invalidate a security-scoped
+                    // bookmark. The app is not sandboxed, so the folder the person chose is still usable.
+                    folder = saved
+                    if let refreshed = try? saved.bookmarkData(options: [.withSecurityScope]) { settings.folderBookmark = refreshed }
+                } else {
                     attention = "Folder access could not be restored. Choose the Desktop folder again."
                 }
             }
@@ -112,11 +130,17 @@ private struct SavedSettings: Codable {
             }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+            MainActor.assumeIsolated { self?.tick(periodic: true) }
         }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
+        // At login and after wake the network can arrive after the app. Offline captures wait
+        // for it instead of using up their attempts.
+        network.pathUpdateHandler = { [weak self] path in
+            MainActor.assumeIsolated { self?.networkChanged(path.status != .unsatisfied) }
+        }
+        network.start(queue: .main)
         render()
         if !settings.enabled || attention != nil { ui.showWindow() }
         checkCodex()
@@ -126,6 +150,16 @@ private struct SavedSettings: Codable {
     private var analyzer: CodexAnalyzer {
         CodexAnalyzer(executableOverride: settings.executablePath.map { URL(fileURLWithPath: $0) })
     }
+
+    private static func savedFolder(atPath path: String?) -> URL? {
+        guard let path else { return nil }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    /// Late Spotlight rejection can still cancel these, so their answers are never reused.
+    private var pendingNames: Set<String> { Set(settings.ledger?.pending.map(\.name) ?? []) }
 
     private func chooseFolder() {
         guard !busy, initialization == nil, !fatalPersistenceError else { return }
@@ -145,9 +179,9 @@ private struct SavedSettings: Codable {
                 if previousScope { previousFolder?.stopAccessingSecurityScopedResource() }
             }
             folder = selected; folderScope = selected.startAccessingSecurityScopedResource()
-            settings.folderBookmark = bookmark
+            settings.folderBookmark = bookmark; settings.folderPath = selected.path
             settings.enabled = false; settings.paused = false; settings.ledger = nil
-            attention = nil
+            attention = nil; folderUnreadable = false
             _ = persist(); render()
         } catch { attention = "Folder access was not granted. Choose the folder again."; render() }
     }
@@ -155,13 +189,13 @@ private struct SavedSettings: Codable {
     private func chooseCodex() {
         guard !busy, !isQuitting else { return }
         let panel = NSOpenPanel(); panel.title = "Locate the Codex CLI"
-        panel.message = "Choose the codex executable. The app otherwise checks standard install locations and installed Codex or ChatGPT apps."
+        panel.message = "Choose the codex executable, Codex.app, or ChatGPT.app."
         panel.canChooseDirectories = false; panel.canChooseFiles = true
         guard panel.runModal() == .OK, let url = panel.url, !busy, !isQuitting else { return }
-        guard FileManager.default.isExecutableFile(atPath: url.path) else {
-            attention = "Choose an executable Codex CLI file."; render(); return
+        guard let executable = try? CodexAnalyzer(executableOverride: url).resolveExecutable() else {
+            attention = "Choose a Codex CLI executable or a Codex or ChatGPT app containing it."; render(); return
         }
-        settings.executablePath = url.path; available = false; settings.previewCompleted = false
+        settings.executablePath = executable.path; available = false; settings.previewCompleted = false
         _ = persist(); checkCodex(replacingCurrent: true)
     }
 
@@ -174,18 +208,44 @@ private struct SavedSettings: Codable {
             switch result {
             case .available:
                 self.available = true; self.codexStatus = "Codex is available · saved login verified"
+                if !self.connectionIssueFromNaming { self.connectionFailures = 0 }
+                self.connectionIssue = nil; self.nextConnectionCheck = nil
                 if !self.fatalPersistenceError && (self.folder != nil || !self.settings.enabled) { self.attention = nil }
             case .unavailable(let error):
-                self.available = false; self.codexStatus = error.localizedDescription
+                self.connectionLost(error, duringNaming: false)
             }
             self.render(); self.tick()
         }
         render()
     }
 
+    /// Stops new submissions and schedules a connection check: within seconds after a slow or
+    /// failed response, minutes for sign-in and CLI problems, and within the hour for usage limits.
+    private func connectionLost(_ error: CodexAnalysisError, duringNaming: Bool) {
+        available = false
+        connectionIssue = error
+        // A later failed check (for example a timeout) does not settle a naming problem.
+        if duringNaming { connectionIssueFromNaming = true }
+        codexStatus = error.isRetryable ? "Codex did not respond. Checking again automatically." : error.localizedDescription
+        connectionFailures += 1
+        nextConnectionCheck = Date().addingTimeInterval(
+            CaptureQueuePolicy.connectionCheckDelay(after: error, consecutiveFailures: connectionFailures))
+    }
+
+    private func networkChanged(_ reachable: Bool) {
+        guard reachable != networkReachable else { return }
+        networkReachable = reachable
+        render()
+        if reachable { tick() }
+    }
+
     /// Preview always uses synthetic images, never existing Desktop files.
     private func preview() {
-        guard available, !busy, !fatalPersistenceError, !isQuitting else { return }
+        guard !busy, !fatalPersistenceError, !isQuitting else { return }
+        guard available else {
+            attention = "Connect Codex using Check Connection before generating preview samples."
+            render(); return
+        }
         busy = true; previews = []; transientDetail = "Naming three generated samples. Their files will not be renamed."
         let client = analyzer
         render()
@@ -240,7 +300,8 @@ private struct SavedSettings: Codable {
 
     private func startWatching() {
         guard let folder else { return }
-        watcher?.stop()
+        // A watcher that failed to restart must read as missing, keeping two-second reconciliation.
+        watcher?.stop(); watcher = nil
         do { watcher = try DirectoryWatcher(url: folder) { [weak self] in self?.tick() } }
         catch { attention = "Filesystem notifications could not start. Folder reconciliation will continue every two seconds." }
     }
@@ -255,11 +316,12 @@ private struct SavedSettings: Codable {
 
     private func retry() {
         guard !fatalPersistenceError, !isQuitting else { return }
-        settings.ledger?.retryFailures(); attention = nil; _ = persist()
+        settings.ledger?.retryFailures(); attention = nil; connectionFailures = 0; connectionIssueFromNaming = false
+        _ = persist()
         if available { tick() } else { checkCodex() }
     }
 
-    private func tick() {
+    private func tick(periodic: Bool = false) {
         guard !fatalPersistenceError, !isQuitting, renamer != nil else { return }
         if Date().timeIntervalSince(lastPruned) > 3600, maintenance == nil {
             maintenance = Task { [weak self] in
@@ -274,7 +336,17 @@ private struct SavedSettings: Codable {
                 _ = self.persist(); self.render()
             }
         }
-        guard settings.enabled, let folder, settings.ledger != nil else { render(); return }
+        // Checks are local and submit nothing, so they also run during setup and while paused.
+        if !available, !checking, !busy, let due = nextConnectionCheck, Date() >= due {
+            nextConnectionCheck = nil
+            checkCodex()
+        }
+        guard settings.enabled, let folder, let ledger = settings.ledger else { render(); return }
+        // Maintenance and connection checks above run on every tick; only the timer's own scan
+        // backs off while idle. An unreadable folder recovers on its next successful scan, so it
+        // keeps the two-second cadence; each failed scan is cheap.
+        guard periodicScans.shouldScan(periodic: periodic, watching: watcher != nil && !folderUnreadable,
+                                       pending: !ledger.pending.isEmpty) else { return }
         scans.request(folder)
     }
 
@@ -282,10 +354,12 @@ private struct SavedSettings: Codable {
         guard !fatalPersistenceError, !isQuitting, settings.enabled, settings.ledger != nil else { return }
         switch result {
         case .success(let observations):
+            // A folder that was briefly unreadable (for example during login) recovers here.
+            if folderUnreadable { folderUnreadable = false; render() }
             guard reconcile(observations) else { return }
             pump(reconciled: true); render()
         case .failure:
-            attention = "Cannot read the watched folder. Restore Desktop access or choose the folder again."
+            folderUnreadable = true
             render()
         }
     }
@@ -301,8 +375,9 @@ private struct SavedSettings: Codable {
     }
 
     private func pump(reconciled: Bool = false) {
-        guard settings.enabled, !settings.paused, available, !busy, !fatalPersistenceError, !isQuitting,
-              let folder else { return }
+        // Naming waits for a running check, so an older check result cannot hide a newer failure.
+        guard settings.enabled, !settings.paused, available, !checking, networkReachable, !busy, !fatalPersistenceError,
+              !isQuitting, let folder else { return }
         // Completion and Resume request a fresh scan. A tick passes its existing
         // observations through to dispatch, without a second directory traversal.
         guard reconciled else { scans.request(folder); return }
@@ -334,7 +409,7 @@ private struct SavedSettings: Codable {
                 }
                 // Reconcile before applying so moves, replacements and paused/resumed sessions
                 // invalidate outstanding submissions even if an old path exists again.
-                let observations = try await self.files.observations(in: folder)
+                let observations = try await self.files.observations(in: folder, freshMetadata: self.pendingNames)
                 self.reconcile(observations)
                 guard !Task.isCancelled, submittedGeneration == self.generation, !self.settings.paused else {
                     self.resetForLater(job.id); return
@@ -345,16 +420,21 @@ private struct SavedSettings: Codable {
                       current.revision == job.revision, matches else {
                     self.resetForLater(job.id); return
                 }
-                if result.useful {
+                // A title that cannot form a safe filename (for example, too long) is treated like an
+                // image without a useful description, rather than as a failed capture.
+                let usable = result.useful && (try? FilenamePolicy.filename(title: result.title, captureDate: job.captureDate,
+                    originalExtension: source.pathExtension, captureDay: job.namingDay)) != nil
+                if usable {
                     self.updateFileState(try await self.files.rename(snapshot, title: result.title, job: job, authorization: authorization))
+                } else if result.useful {
+                    self.recordForReview(job, proposed: result.title, reason: "suggested name could not be used")
                 } else {
-                    let title = (try? FilenamePolicy.validatedTitle(result.title)) ?? "No useful description"
-                    self.settings.suggestions.append(ReviewSuggestion(original: job.name, proposed: title,
-                        detail: "Original preserved · image needs review", date: Date()))
-                    self.settings.suggestions = Array(self.settings.suggestions.suffix(100))
+                    self.recordForReview(job, proposed: (try? FilenamePolicy.validatedTitle(result.title)) ?? "No useful description",
+                                         reason: "image needs review")
                 }
                 self.settings.ledger?.finish(job.id)
-                self.attention = nil; _ = self.persist()
+                self.attention = nil; self.connectionFailures = 0; self.connectionIssueFromNaming = false
+                _ = self.persist()
             } catch {
                 // A post-rename journal failure must still stop processing if Pause
                 // arrived while the background transaction was completing.
@@ -363,26 +443,36 @@ private struct SavedSettings: Codable {
                 if error is CancellationError || Task.isCancelled || submittedGeneration != self.generation {
                     self.resetForLater(job.id); return
                 }
-                if let observations = try? await self.files.observations(in: folder) { self.reconcile(observations) }
+                if let observations = try? await self.files.observations(in: folder, freshMetadata: self.pendingNames) {
+                    self.reconcile(observations)
+                }
                 if Task.isCancelled || submittedGeneration != self.generation { self.resetForLater(job.id); return }
                 guard var current = self.settings.ledger?.capture(job.id) else { _ = self.persist(); return }
                 if current.identity != job.identity || current.revision != job.revision {
                     // A failed request for the old version must not fail a fresh editor save.
                     if let error = error as? CodexAnalysisError,
                        error == .authenticationRequired || error == .quotaExceeded || error == .unavailable {
-                        self.available = false; self.codexStatus = error.localizedDescription
+                        self.connectionLost(error, duringNaming: true)
                     }
                     _ = self.persist(); return
                 }
                 if let error = error as? CodexAnalysisError {
-                    if self.queuePolicy.fail(&current, with: error) {
-                        self.attention = "\(error.localizedDescription) A bounded retry is pending."
-                    } else {
-                        current.state = .failed; self.attention = "\(error.localizedDescription) Use Retry Pending when ready."
-                        // Stop all further submissions when account availability needs attention.
-                        if error == .authenticationRequired || error == .quotaExceeded || error == .unavailable {
-                            self.available = false; self.codexStatus = error.localizedDescription
-                        }
+                    switch self.queuePolicy.fail(&current, with: error) {
+                    case .retryScheduled:
+                        break
+                    case .awaitingConnection:
+                        // Stop all further submissions until a connection check succeeds. Other
+                        // captures go first then, in case this failure is specific to this image.
+                        self.connectionLost(error, duringNaming: true)
+                        self.settings.ledger?.moveToBack(current.id)
+                    case .keepOriginal:
+                        self.recordForReview(job, proposed: "No usable name", reason: error.localizedDescription)
+                        self.settings.ledger?.finish(job.id)
+                        _ = self.persist(); return
+                    case .failed:
+                        self.attention = "\(error.localizedDescription) Use Retry Pending when ready."
+                        // Sign-in, usage and CLI problems still stop further submissions.
+                        if !error.isRetryable { self.connectionLost(error, duringNaming: true) }
                     }
                 } else {
                     current.state = .failed
@@ -396,6 +486,13 @@ private struct SavedSettings: Codable {
     private func resetForLater(_ id: UUID) {
         if settings.ledger != nil { queuePolicy.reset(id, in: &settings.ledger!) }
         _ = persist()
+    }
+
+    /// The screenshot keeps its original name and the outcome is listed under Preview for review.
+    private func recordForReview(_ job: PendingCapture, proposed: String, reason: String) {
+        settings.suggestions.append(ReviewSuggestion(original: job.name, proposed: proposed,
+                                                     detail: "Original preserved · \(reason)", date: Date()))
+        settings.suggestions = Array(settings.suggestions.suffix(100))
     }
 
     private func undo(_ id: UUID) {
@@ -458,19 +555,38 @@ private struct SavedSettings: Codable {
 
     private func render() {
         guard ui != nil else { return }
-        let failedCount = settings.ledger?.pending.filter { $0.state == .failed }.count ?? 0
+        let pending = settings.ledger?.pending ?? []
+        let failedCount = pending.filter { $0.state == .failed }.count
+        let retryingCount = pending.filter { $0.state == .retry }.count
+        // A known problem stays reported while an automatic check runs. A slow or failed
+        // connection check is retried automatically and needs the person only if it persists.
+        let codexProblem = !available && (!checking || connectionIssue != nil)
+        let reconnecting = codexProblem && connectionIssue?.isRetryable == true && connectionFailures < 5
+        let codexNeedsAttention = codexProblem && !reconnecting
+        // A slow or failed check describes the check, not a naming request.
+        let codexMessage = connectionIssue.map { $0.isRetryable ? "Codex did not respond." : $0.localizedDescription } ?? codexStatus
         let status: String
         if fatalPersistenceError || (settings.enabled && folder == nil) { status = "Needs attention" }
         else if settings.enabled && settings.paused { status = "Paused" }
         else if busy { status = "Naming" }
-        else if attention != nil || (!available && !checking) || overflow || failedCount > 0 { status = "Needs attention" }
+        else if attention != nil || folderUnreadable || codexNeedsAttention || overflow || failedCount > 0 { status = "Needs attention" }
         else if settings.enabled { status = "Watching" }
         else { status = "Ready to set up" }
-        let pendingCount = settings.ledger?.pending.count ?? 0
-        let detail = attention ?? transientDetail ?? (overflow ? "Queue is full (64 captures). Additional captures will be picked up as space becomes available." :
-            settings.paused ? "No new images will be submitted or renamed. An image already submitted cannot be recalled." :
-            failedCount > 0 ? "\(failedCount) captures need attention. Resolve the issue, then use Retry Pending." :
-            settings.enabled ? "Watching for new screenshots · \(pendingCount) pending" : "Choose Desktop, preview generated samples, then enable automatic naming.")
+        let detail: String
+        if let message = attention ?? transientDetail { detail = message }
+        else if settings.enabled && folder == nil { detail = "Folder access could not be restored. Choose the Desktop folder again." }
+        else if folderUnreadable { detail = "Cannot read the watched folder. Restore Desktop access or choose the folder again." }
+        else if overflow { detail = "Queue is full (64 captures). Additional captures will be picked up as space becomes available." }
+        else if settings.paused { detail = "No new images will be submitted or renamed. An image already submitted cannot be recalled." }
+        else if failedCount > 0 { detail = "\(failedCount) captures need attention. Resolve the issue, then use Retry Pending." }
+        else if codexNeedsAttention {
+            detail = settings.enabled ? "\(codexMessage) Naming resumes automatically once Codex is available." : codexMessage
+        }
+        else if !settings.enabled { detail = "Choose Desktop, preview generated samples, then enable automatic naming." }
+        else if reconnecting { detail = "Codex did not respond. Retrying automatically · \(pending.count) pending" }
+        else if !networkReachable && !pending.isEmpty { detail = "Waiting for a network connection · \(pending.count) pending" }
+        else if retryingCount > 0 { detail = "Watching for new screenshots · \(pending.count) pending, \(retryingCount) retrying automatically" }
+        else { detail = "Watching for new screenshots · \(pending.count) pending" }
         // Keep the journal snapshot so timer/status renders reuse its presentation.
         let historyEntries = renamer?.history ?? []
         if historyEntries != lastHistoryEntries {
@@ -482,8 +598,9 @@ private struct SavedSettings: Codable {
         }
         let history = historyPresentation
         let suggestions = settings.suggestions.reversed().map { UIPreviewItem(original: $0.original, proposed: $0.proposed, details: $0.detail) }
+        // Automatic rechecks of a known problem run in the background without disabling controls.
         let state = UIState(status: status, detail: detail, folder: folder?.path, codexStatus: codexStatus,
-                          isEnabled: settings.enabled, isPaused: settings.paused, isBusy: busy || checking,
+                          isEnabled: settings.enabled, isPaused: settings.paused, isBusy: busy || (checking && connectionIssue == nil),
                           canEnable: settings.previewCompleted && available && folder != nil && renamer != nil && !fatalPersistenceError,
                           history: history, previews: previews + suggestions)
         if state != lastRendered { ui.update(state); lastRendered = state }
@@ -499,6 +616,7 @@ private struct SavedSettings: Codable {
     func stop() async {
         isQuitting = true
         generation += 1; mutationAuthorization?.cancel(); work?.cancel(); scans.invalidate(); watcher?.stop(); timer?.invalidate()
+        network.cancel()
         _ = persist()
         // Allow the CLI cancellation handler to terminate its child and clean temporary files.
         await connectionCheck.stop()

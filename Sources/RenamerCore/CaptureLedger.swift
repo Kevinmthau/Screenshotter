@@ -118,6 +118,11 @@ public struct CaptureLedger: Codable, Equatable, Sendable {
         if let i = pending.firstIndex(where: { $0.id == job.id }) { pending[i] = job }
     }
     public mutating func finish(_ id: UUID) { pending.removeAll { $0.id == id } }
+    /// Lets other captures go first, so one image cannot hold the queue while Codex recovers.
+    public mutating func moveToBack(_ id: UUID) {
+        guard let index = pending.firstIndex(where: { $0.id == id }) else { return }
+        pending.append(pending.remove(at: index))
+    }
     public mutating func prunePending(before cutoff: Date) {
         pending.removeAll { $0.stableSince < cutoff }
     }

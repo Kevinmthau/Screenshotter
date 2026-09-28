@@ -91,6 +91,7 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
 
     private struct MenuState: Equatable {
         let status: String
+        let reason: String?
         let isEnabled: Bool
         let isPaused: Bool
         let isBusy: Bool
@@ -122,8 +123,16 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
 
     func windowDidBecomeKey(_ notification: Notification) { refreshVisibleRows() }
     func windowDidDeminiaturize(_ notification: Notification) { refreshVisibleRows() }
-    func menuWillOpen(_ menu: NSMenu) {
-        loginMenuItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    func menuWillOpen(_ menu: NSMenu) { refreshLoginMenuItem() }
+
+    /// Registered but not yet allowed in System Settings is shown as mixed, not as off.
+    private func refreshLoginMenuItem() {
+        guard let item = loginMenuItem else { return }
+        switch SMAppService.mainApp.status {
+        case .enabled: item.state = .on; item.title = "Open at Login"
+        case .requiresApproval: item.state = .mixed; item.title = "Open at Login (Allow in System Settings…)"
+        default: item.state = .off; item.title = "Open at Login"
+        }
     }
 
     func update(_ state: UIState) {
@@ -141,7 +150,8 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         retryButton.isEnabled = state.isEnabled && !state.isBusy && !state.isPaused
         clearButton.isEnabled = (!state.history.isEmpty || !state.previews.isEmpty) && !state.isBusy
         refreshVisibleRows()
-        let menuState = MenuState(status: state.status, isEnabled: state.isEnabled,
+        let menuState = MenuState(status: state.status, reason: state.status == "Needs attention" ? state.detail : nil,
+                                  isEnabled: state.isEnabled,
                                   isPaused: state.isPaused, isBusy: state.isBusy,
                                   recent: Array(state.history.prefix(5)))
         if menuState != renderedMenu {
@@ -418,6 +428,13 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         let heading = NSMenuItem(title: "Screenshot Renamer · \(state.status)", action: nil, keyEquivalent: "")
         heading.isEnabled = false
         menu.addItem(heading)
+        if state.status == "Needs attention" {
+            // Say why here; the full text is in the tooltip and the Settings window.
+            let reason = NSMenuItem(title: AppUI.menuSummary(of: state.detail), action: nil, keyEquivalent: "")
+            reason.isEnabled = false
+            reason.toolTip = state.detail
+            menu.addItem(reason)
+        }
         menu.addItem(.separator())
         menu.addItem(menuItem("Settings & Preview…", #selector(openSettings), key: ","))
         menu.addItem(menuItem("History…", #selector(openHistory)))
@@ -446,8 +463,8 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
         let login = menuItem("Open at Login", #selector(toggleLogin))
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         loginMenuItem = login
+        refreshLoginMenuItem()
         menu.addItem(login)
         menu.addItem(.separator())
         menu.addItem(menuItem("Quit Screenshot Renamer", #selector(quit), key: "q"))
@@ -484,15 +501,18 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
     @objc private func toggleLogin() {
         do {
             switch SMAppService.mainApp.status {
-            case .enabled, .requiresApproval:
+            case .enabled:
                 try SMAppService.mainApp.unregister()
+            case .requiresApproval:
+                // Already registered: it is allowed or turned off with the switch in System Settings.
+                SMAppService.openSystemSettingsLoginItems()
             default:
                 try SMAppService.mainApp.register()
                 if SMAppService.mainApp.status == .requiresApproval {
                     SMAppService.openSystemSettingsLoginItems()
                 }
             }
-            rebuildMenu()
+            refreshLoginMenuItem()
         } catch {
             let alert = NSAlert()
             alert.messageText = "Couldn’t change Open at Login"
@@ -501,6 +521,15 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
             NSApp.activate(ignoringOtherApps: true)
             alert.runModal()
         }
+    }
+
+    /// Menu items do not wrap, so a long explanation is shortened to its first sentence.
+    private static func menuSummary(of detail: String) -> String {
+        guard detail.count > 80 else { return detail }
+        if let end = detail.range(of: ". "), detail.distance(from: detail.startIndex, to: end.lowerBound) < 80 {
+            return String(detail[...end.lowerBound])
+        }
+        return String(detail.prefix(79)) + "…"
     }
 
     private func menuItem(_ title: String, _ action: Selector, key: String = "", enabled: Bool = true) -> NSMenuItem {

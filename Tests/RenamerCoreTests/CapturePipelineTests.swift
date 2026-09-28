@@ -115,6 +115,91 @@ final class CapturePipelineTests: XCTestCase {
         XCTAssertEqual(last.map(\.name), [moved.lastPathComponent])
     }
 
+    func testScannerReusesOnlyDefiniteSpotlightAnswersForUnchangedFiles() throws {
+        let known = directory.appendingPathComponent("Screenshot 2026-09-21 at 1.00.00 PM.png")
+        let unknown = directory.appendingPathComponent("Screenshot 2026-09-21 at 1.01.00 PM.png")
+        try Data([1]).write(to: known)
+        try Data([2]).write(to: unknown)
+        try Data([3]).write(to: directory.appendingPathComponent("download.png"))
+        var answers = [known.lastPathComponent: true]
+        var lookups: [String] = []
+        var scanner = CaptureDirectoryScanner { url in
+            lookups.append(url.lastPathComponent)
+            return answers[url.lastPathComponent]
+        }
+        func scan() throws -> [String: Bool] {
+            lookups = []
+            return Dictionary(uniqueKeysWithValues: try scanner.observations(in: directory).map { ($0.name, $0.eligible) })
+        }
+        XCTAssertEqual(try scan(), [known.lastPathComponent: true, unknown.lastPathComponent: true, "download.png": false])
+        XCTAssertEqual(Set(lookups), [known.lastPathComponent, unknown.lastPathComponent])
+        _ = try scan()
+        XCTAssertEqual(lookups, [unknown.lastPathComponent], "Only the unknown answer is read again")
+        answers[unknown.lastPathComponent] = false
+        XCTAssertEqual(try scan()[unknown.lastPathComponent], false, "Late metadata rejection is still observed")
+        XCTAssertEqual(lookups, [unknown.lastPathComponent])
+        XCTAssertEqual(try scan()[unknown.lastPathComponent], false)
+        XCTAssertEqual(lookups, [])
+        // Screenshot metadata is an extended attribute; writing one changes ctime and the revision.
+        answers[unknown.lastPathComponent] = true
+        let flag = try PropertyListSerialization.data(fromPropertyList: true, format: .binary, options: 0)
+        XCTAssertEqual(flag.withUnsafeBytes {
+            setxattr(unknown.path, "com.apple.metadata:kMDItemIsScreenCapture", $0.baseAddress, $0.count, 0, 0)
+        }, 0)
+        XCTAssertEqual(try scan()[unknown.lastPathComponent], true)
+        XCTAssertEqual(lookups, [unknown.lastPathComponent])
+        answers[known.lastPathComponent] = false
+        try Data([1, 2]).write(to: known)
+        XCTAssertEqual(try scan()[known.lastPathComponent], false, "An edit is read again")
+        XCTAssertEqual(lookups, [known.lastPathComponent])
+        answers[known.lastPathComponent] = true
+        try Data([1, 2]).write(to: known, options: .atomic)
+        XCTAssertEqual(try scan()[known.lastPathComponent], true, "A replacement is read again")
+        XCTAssertEqual(lookups, [known.lastPathComponent])
+    }
+
+    func testPendingCapturesIgnoreCachedSpotlightAnswers() throws {
+        let capture = directory.appendingPathComponent("Screenshot 2026-09-21 at 1.00.00 PM.png")
+        try Data([1]).write(to: capture)
+        // Just after an edit or replacement, Spotlight can still return the previous answer.
+        var answer = true
+        var lookups = 0
+        var scanner = CaptureDirectoryScanner { _ in lookups += 1; return answer }
+        XCTAssertEqual(try scanner.observations(in: directory).first?.eligible, true)
+        answer = false
+        XCTAssertEqual(try scanner.observations(in: directory).first?.eligible, true, "Files that are not pending reuse the answer")
+        XCTAssertEqual(try scanner.observations(in: directory, freshMetadata: [capture.lastPathComponent]).first?.eligible, false,
+                       "A pending capture still sees the late rejection")
+        XCTAssertEqual(lookups, 2)
+    }
+
+    func testIdleRescansOfScreenshotsWithMetadataSkipSpotlight() throws {
+        for index in 0..<200 {
+            let name = String(format: "Screenshot 2026-09-21 at %d.%02d.00 PM.png", 1 + index / 60, index % 60)
+            try Data([1]).write(to: directory.appendingPathComponent(name))
+        }
+        var lookups = 0
+        var scanner = CaptureDirectoryScanner { _ in lookups += 1; return true }
+        // Thirty seconds of two-second rescans previously repeated all 200 lookups each time.
+        for _ in 0..<15 { XCTAssertEqual(try scanner.observations(in: directory).filter(\.eligible).count, 200) }
+        XCTAssertEqual(lookups, 200)
+    }
+
+    func testTimerScansBackOffOnlyWhileWatchedWithNothingPending() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        var policy = PeriodicScanPolicy()
+        func timer(_ seconds: StrideTo<Double>, watching: Bool = true, pending: Bool = false) -> [Double] {
+            seconds.filter { policy.shouldScan(periodic: true, watching: watching, pending: pending, now: start.addingTimeInterval($0)) }
+        }
+        XCTAssertEqual(timer(stride(from: 0, to: 600, by: 2)).count, 20, "Ten idle minutes scan every 30 seconds, not 300 times")
+        XCTAssertEqual(timer(stride(from: 600, to: 620, by: 2), pending: true).count, 10)
+        XCTAssertEqual(timer(stride(from: 620, to: 640, by: 2), watching: false).count, 10)
+        XCTAssertTrue(policy.shouldScan(periodic: false, watching: true, pending: false, now: start.addingTimeInterval(641)),
+                      "Filesystem events, wake, resume and retry always scan")
+        XCTAssertEqual(timer(stride(from: 642, to: 700, by: 2)), [672], "and restart the idle interval")
+        XCTAssertEqual(timer(stride(from: 100, to: 104, by: 2)), [100], "A clock set back cannot suspend the safety net")
+    }
+
     @MainActor func testStaleQueueAndCancellationPreventAnalyzerSubmission() async throws {
         let source = directory.appendingPathComponent("Screenshot 2026-09-21 at 1.00.00 PM.png")
         try Data([1, 2, 3]).write(to: source)
@@ -245,13 +330,13 @@ final class CapturePipelineTests: XCTestCase {
         var job = try XCTUnwrap(policy.claim(from: &ledger))
         XCTAssertEqual(job.state, .analyzing)
         XCTAssertNil(policy.claim(from: &ledger))
-        XCTAssertTrue(policy.fail(&job, with: .offline))
+        XCTAssertEqual(policy.fail(&job, with: .offline), .retryScheduled)
         XCTAssertEqual(job.nextAttempt, now.addingTimeInterval(15))
         job.attempts = 2
-        XCTAssertTrue(policy.fail(&job, with: .timedOut))
+        XCTAssertEqual(policy.fail(&job, with: .timedOut), .retryScheduled)
         XCTAssertEqual(job.nextAttempt, now.addingTimeInterval(60))
-        job.attempts = 3
-        XCTAssertFalse(policy.fail(&job, with: .offline))
+        job.attempts = CaptureQueuePolicy.maximumAttempts
+        XCTAssertEqual(policy.fail(&job, with: .offline), .failed)
         XCTAssertEqual(job.state, .failed)
         ledger.update(job)
         policy.reset(job.id, in: &ledger)
