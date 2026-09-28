@@ -165,9 +165,9 @@ public struct CodexAnalyzer: Sendable {
                 && !isDirectory.boolValue && manager.isExecutableFile(atPath: url.path)
         }
         if let explicit = executableOverride {
-            let executable = explicit.pathExtension.lowercased() == "app"
-                ? explicit.appendingPathComponent("Contents/Resources/codex") : explicit
-            guard isExecutableFile(executable) else {
+            let candidates = explicit.pathExtension.lowercased() == "app"
+                ? Self.bundledExecutableCandidates(in: explicit) : [explicit]
+            guard let executable = candidates.first(where: isExecutableFile) else {
                 throw CodexAnalysisError.unavailable
             }
             return executable
@@ -178,20 +178,27 @@ public struct CodexAnalyzer: Sendable {
         candidates += ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"].map { URL(fileURLWithPath: $0) }
         for bundleID in ["com.openai.codex", "com.openai.chat"] {
             if let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-                candidates.append(app.appendingPathComponent("Contents/Resources/codex"))
+                candidates += Self.bundledExecutableCandidates(in: app)
             }
         }
         // Stable application names are fallbacks only; no versioned cache paths are embedded.
         for applications in [URL(fileURLWithPath: "/Applications"),
                              manager.homeDirectoryForCurrentUser.appendingPathComponent("Applications")] {
             for name in ["Codex.app", "ChatGPT.app"] {
-                candidates.append(applications.appendingPathComponent(name).appendingPathComponent("Contents/Resources/codex"))
+                candidates += Self.bundledExecutableCandidates(in: applications.appendingPathComponent(name))
             }
         }
         guard let executable = candidates.first(where: isExecutableFile) else {
             throw CodexAnalysisError.unavailable
         }
         return executable
+    }
+
+    private static func bundledExecutableCandidates(in app: URL) -> [URL] {
+        // Current ChatGPT bundles package the CLI in its own app. Retain the older
+        // layout for existing Codex/ChatGPT installs, using the same order everywhere.
+        ["Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+         "Contents/Resources/codex"].map { app.appendingPathComponent($0) }
     }
 
     func safeEnvironment(temporaryDirectory: URL) -> [String: String] {

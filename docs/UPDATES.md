@@ -1,7 +1,7 @@
 # App updates and releases
 
 Screenshot Renamer uses Sparkle 2.10.0. The app checks daily for updates and offers
-**Check for Updates…** in its menu. Downloading and installing an available update
+**Check for Updates…** in its menu and Settings & Preview window. Downloading and installing an available update
 requires the user's approval; silent installation is disabled. A Mac running the
 older app without Sparkle needs one manual installation of version 1.1.0 or later.
 

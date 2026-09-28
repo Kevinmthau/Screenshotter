@@ -69,6 +69,7 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
     private let pauseButton = NSButton(title: "Pause", target: nil, action: nil)
     private let retryButton = NSButton(title: "Retry Pending", target: nil, action: nil)
     private let clearButton = NSButton(title: "Clear History", target: nil, action: nil)
+    private let updateButton = NSButton(title: "Check for Updates…", target: nil, action: nil)
     private let previewRows = NSStackView()
     private let historyRows = NSStackView()
     private var setupPane: NSScrollView!
@@ -160,6 +161,7 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         pauseButton.isEnabled = state.isEnabled
         retryButton.isEnabled = state.isEnabled && !state.isBusy && !state.isPaused
         clearButton.isEnabled = (!state.history.isEmpty || !state.previews.isEmpty) && !state.isBusy
+        updateButton.isEnabled = state.updates.canCheck
         refreshVisibleRows()
         let menuState = MenuState(status: state.status, reason: state.status == "Needs attention" ? state.detail : nil,
                                   isEnabled: state.isEnabled,
@@ -253,7 +255,9 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
             pin(pane, to: content)
         }
 
-        let footer = label("Only new screenshots. Original image contents preserved. Undo from History.", size: 11, color: .tertiaryLabelColor)
+        let footerText = label("Only new screenshots. Original image contents preserved. Undo from History.", size: 11, color: .tertiaryLabelColor)
+        wire(updateButton, #selector(checkForUpdates))
+        let footer = horizontal([footerText, spacer(), updateButton], spacing: 12)
         let layout = vertical([header, statusCard, segmentRow, content, footer], spacing: 18)
         root.addSubview(layout)
         pin(layout, to: root, inset: 24)
