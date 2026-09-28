@@ -49,6 +49,25 @@ final class FailureRecoveryTests: XCTestCase {
         XCTAssertEqual(policy.claim(from: &ledger)?.attempts, 2)
     }
 
+    func testCaptureWaitingForConnectionDoesNotHoldTheQueue() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let policy = CaptureQueuePolicy(now: { now })
+        var ledger = CaptureLedger(baseline: [], activatedAt: now.addingTimeInterval(-10))
+        ledger.reconcile([
+            CaptureObservation(name: "Screenshot 2026-09-21 at 1.00.00 PM.png", identity: "1", revision: "1",
+                               created: now.addingTimeInterval(-2), captureDate: now, eligible: true),
+            CaptureObservation(name: "Screenshot 2026-09-21 at 1.01.00 PM.png", identity: "2", revision: "1",
+                               created: now.addingTimeInterval(-1), captureDate: now, eligible: true)
+        ], now: now.addingTimeInterval(-3))
+        var capture = try XCTUnwrap(policy.claim(from: &ledger))
+        XCTAssertEqual(capture.identity, "1")
+        XCTAssertEqual(policy.fail(&capture, with: .quotaExceeded), .awaitingConnection)
+        ledger.update(capture)
+        ledger.moveToBack(capture.id)
+        XCTAssertEqual(ledger.nextReady(now: now)?.identity, "2")
+        XCTAssertEqual(ledger.pending.last?.id, capture.id)
+    }
+
     func testUnreadableImagesAndInvalidAnswersKeepOriginalAfterThirdAttempt() {
         let now = Date(timeIntervalSince1970: 1_000)
         let policy = CaptureQueuePolicy(now: { now })

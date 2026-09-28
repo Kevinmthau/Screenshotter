@@ -48,6 +48,9 @@ private struct SavedSettings: Codable {
     private var codexStatus = "Checking saved Codex login…"
     // Set while Codex is unavailable. Checks are local and never submit an image.
     private var connectionIssue: CodexAnalysisError?
+    // A check cannot confirm a problem reported by naming (a revoked login, a missing
+    // model, a usage limit) is resolved; only a successful naming can.
+    private var connectionIssueFromNaming = false
     private var connectionFailures = 0
     private var nextConnectionCheck: Date?
     private let network = NWPathMonitor()
@@ -205,12 +208,11 @@ private struct SavedSettings: Codable {
             switch result {
             case .available:
                 self.available = true; self.codexStatus = "Codex is available · saved login verified"
-                // A check cannot see usage limits, so their backoff resets only after a successful naming.
-                if self.connectionIssue != .quotaExceeded { self.connectionFailures = 0 }
+                if !self.connectionIssueFromNaming { self.connectionFailures = 0 }
                 self.connectionIssue = nil; self.nextConnectionCheck = nil
                 if !self.fatalPersistenceError && (self.folder != nil || !self.settings.enabled) { self.attention = nil }
             case .unavailable(let error):
-                self.connectionLost(error)
+                self.connectionLost(error, duringNaming: false)
             }
             self.render(); self.tick()
         }
@@ -218,9 +220,10 @@ private struct SavedSettings: Codable {
 
     /// Stops new submissions and schedules a connection check: within seconds after a slow or
     /// failed response, minutes for sign-in and CLI problems, and within the hour for usage limits.
-    private func connectionLost(_ error: CodexAnalysisError) {
+    private func connectionLost(_ error: CodexAnalysisError, duringNaming: Bool) {
         available = false
         connectionIssue = error
+        connectionIssueFromNaming = duringNaming
         codexStatus = error.isRetryable ? "Codex did not respond. Checking again automatically." : error.localizedDescription
         connectionFailures += 1
         nextConnectionCheck = Date().addingTimeInterval(
@@ -329,11 +332,12 @@ private struct SavedSettings: Codable {
                 _ = self.persist(); self.render()
             }
         }
-        guard settings.enabled, let folder, settings.ledger != nil else { render(); return }
-        if !available, !checking, !busy, !settings.paused, let due = nextConnectionCheck, Date() >= due {
+        // Checks are local and submit nothing, so they also run during setup and while paused.
+        if !available, !checking, !busy, let due = nextConnectionCheck, Date() >= due {
             nextConnectionCheck = nil
             checkCodex()
         }
+        guard settings.enabled, let folder, settings.ledger != nil else { render(); return }
         scans.request(folder)
     }
 
@@ -362,8 +366,9 @@ private struct SavedSettings: Codable {
     }
 
     private func pump(reconciled: Bool = false) {
-        guard settings.enabled, !settings.paused, available, networkReachable, !busy, !fatalPersistenceError, !isQuitting,
-              let folder else { return }
+        // Naming waits for a running check, so an older check result cannot hide a newer failure.
+        guard settings.enabled, !settings.paused, available, !checking, networkReachable, !busy, !fatalPersistenceError,
+              !isQuitting, let folder else { return }
         // Completion and Resume request a fresh scan. A tick passes its existing
         // observations through to dispatch, without a second directory traversal.
         guard reconciled else { scans.request(folder); return }
@@ -435,7 +440,7 @@ private struct SavedSettings: Codable {
                     // A failed request for the old version must not fail a fresh editor save.
                     if let error = error as? CodexAnalysisError,
                        error == .authenticationRequired || error == .quotaExceeded || error == .unavailable {
-                        self.connectionLost(error)
+                        self.connectionLost(error, duringNaming: true)
                     }
                     _ = self.persist(); return
                 }
@@ -444,8 +449,10 @@ private struct SavedSettings: Codable {
                     case .retryScheduled:
                         break
                     case .awaitingConnection:
-                        // Stop all further submissions until a connection check succeeds.
-                        self.connectionLost(error)
+                        // Stop all further submissions until a connection check succeeds. Other
+                        // captures go first then, in case this failure is specific to this image.
+                        self.connectionLost(error, duringNaming: true)
+                        self.settings.ledger?.moveToBack(current.id)
                     case .keepOriginal:
                         self.recordForReview(job, proposed: "No usable name", reason: error.localizedDescription)
                         self.settings.ledger?.finish(job.id)
@@ -453,7 +460,7 @@ private struct SavedSettings: Codable {
                     case .failed:
                         self.attention = "\(error.localizedDescription) Use Retry Pending when ready."
                         // Sign-in, usage and CLI problems still stop further submissions.
-                        if !error.isRetryable { self.connectionLost(error) }
+                        if !error.isRetryable { self.connectionLost(error, duringNaming: true) }
                     }
                 } else {
                     current.state = .failed
@@ -540,10 +547,12 @@ private struct SavedSettings: Codable {
         let failedCount = pending.filter { $0.state == .failed }.count
         let retryingCount = pending.filter { $0.state == .retry }.count
         // A known problem stays reported while an automatic check runs. A slow or failed
-        // connection check is retried automatically; it does not need the person.
+        // connection check is retried automatically and needs the person only if it persists.
         let codexProblem = !available && (!checking || connectionIssue != nil)
-        let reconnecting = settings.enabled && codexProblem && connectionIssue?.isRetryable == true
+        let reconnecting = codexProblem && connectionIssue?.isRetryable == true && connectionFailures < 5
         let codexNeedsAttention = codexProblem && !reconnecting
+        // A slow or failed check describes the check, not a naming request.
+        let codexMessage = connectionIssue.map { $0.isRetryable ? "Codex did not respond." : $0.localizedDescription } ?? codexStatus
         let status: String
         if fatalPersistenceError || (settings.enabled && folder == nil) { status = "Needs attention" }
         else if settings.enabled && settings.paused { status = "Paused" }
@@ -553,14 +562,15 @@ private struct SavedSettings: Codable {
         else { status = "Ready to set up" }
         let detail: String
         if let message = attention ?? transientDetail { detail = message }
+        else if settings.enabled && folder == nil { detail = "Folder access could not be restored. Choose the Desktop folder again." }
         else if folderUnreadable { detail = "Cannot read the watched folder. Restore Desktop access or choose the folder again." }
         else if overflow { detail = "Queue is full (64 captures). Additional captures will be picked up as space becomes available." }
         else if settings.paused { detail = "No new images will be submitted or renamed. An image already submitted cannot be recalled." }
         else if failedCount > 0 { detail = "\(failedCount) captures need attention. Resolve the issue, then use Retry Pending." }
-        else if !settings.enabled { detail = "Choose Desktop, preview generated samples, then enable automatic naming." }
         else if codexNeedsAttention {
-            detail = "\(connectionIssue?.localizedDescription ?? codexStatus) Naming resumes automatically once Codex is available."
+            detail = settings.enabled ? "\(codexMessage) Naming resumes automatically once Codex is available." : codexMessage
         }
+        else if !settings.enabled { detail = "Choose Desktop, preview generated samples, then enable automatic naming." }
         else if reconnecting { detail = "Codex did not respond. Retrying automatically · \(pending.count) pending" }
         else if !networkReachable && !pending.isEmpty { detail = "Waiting for a network connection · \(pending.count) pending" }
         else if retryingCount > 0 { detail = "Watching for new screenshots · \(pending.count) pending, \(retryingCount) retrying automatically" }
@@ -576,8 +586,9 @@ private struct SavedSettings: Codable {
         }
         let history = historyPresentation
         let suggestions = settings.suggestions.reversed().map { UIPreviewItem(original: $0.original, proposed: $0.proposed, details: $0.detail) }
+        // Automatic rechecks of a known problem run in the background without disabling controls.
         let state = UIState(status: status, detail: detail, folder: folder?.path, codexStatus: codexStatus,
-                          isEnabled: settings.enabled, isPaused: settings.paused, isBusy: busy || checking,
+                          isEnabled: settings.enabled, isPaused: settings.paused, isBusy: busy || (checking && connectionIssue == nil),
                           canEnable: settings.previewCompleted && available && folder != nil && renamer != nil && !fatalPersistenceError,
                           history: history, previews: previews + suggestions)
         if state != lastRendered { ui.update(state); lastRendered = state }
