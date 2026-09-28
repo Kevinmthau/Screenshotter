@@ -158,6 +158,21 @@ final class CapturePipelineTests: XCTestCase {
         XCTAssertEqual(lookups, [known.lastPathComponent])
     }
 
+    func testPendingCapturesIgnoreCachedSpotlightAnswers() throws {
+        let capture = directory.appendingPathComponent("Screenshot 2026-09-21 at 1.00.00 PM.png")
+        try Data([1]).write(to: capture)
+        // Just after an edit or replacement, Spotlight can still return the previous answer.
+        var answer = true
+        var lookups = 0
+        var scanner = CaptureDirectoryScanner { _ in lookups += 1; return answer }
+        XCTAssertEqual(try scanner.observations(in: directory).first?.eligible, true)
+        answer = false
+        XCTAssertEqual(try scanner.observations(in: directory).first?.eligible, true, "Files that are not pending reuse the answer")
+        XCTAssertEqual(try scanner.observations(in: directory, freshMetadata: [capture.lastPathComponent]).first?.eligible, false,
+                       "A pending capture still sees the late rejection")
+        XCTAssertEqual(lookups, 2)
+    }
+
     func testIdleRescansOfScreenshotsWithMetadataSkipSpotlight() throws {
         for index in 0..<200 {
             let name = String(format: "Screenshot 2026-09-21 at %d.%02d.00 PM.png", 1 + index / 60, index % 60)

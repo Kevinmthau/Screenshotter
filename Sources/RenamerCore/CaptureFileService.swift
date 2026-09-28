@@ -38,9 +38,11 @@ public final class CaptureFileService: @unchecked Sendable {
         }
     }
 
-    public func observations(in directory: URL) async throws -> CaptureObservationBatch {
+    /// `freshMetadata` names the pending captures, whose Spotlight answers are never reused.
+    public func observations(in directory: URL, freshMetadata: Set<String> = []) async throws -> CaptureObservationBatch {
         try await perform {
-            let files = try self.scanOverride.map { try $0(directory) } ?? self.scanner.observations(in: directory)
+            let files = try self.scanOverride.map { try $0(directory) }
+                ?? self.scanner.observations(in: directory, freshMetadata: freshMetadata)
             self.revision += 1
             return CaptureObservationBatch(revision: self.revision, files: files)
         }
@@ -102,7 +104,9 @@ public final class CaptureFileService: @unchecked Sendable {
 /// Cache filename-derived values, and Spotlight answers once definite. Identity and revision
 /// are re-read on every scan. A cached answer applies only to the same identity and revision,
 /// whose ctime also changes with extended attributes. Unknown answers are re-read on every
-/// scan, so late metadata rejection and editor replacements are still observed.
+/// scan, so late metadata rejection and editor replacements are still observed. Spotlight can
+/// briefly return a replaced or edited file's previous answer, so pending captures, the only
+/// files whose eligibility can still change the queue, are read fresh on every scan.
 struct CaptureDirectoryScanner {
     private struct CachedName {
         let created: Date
@@ -128,7 +132,7 @@ struct CaptureDirectoryScanner {
         return (MDItemCopyAttribute(item, "kMDItemIsScreenCapture" as CFString) as? NSNumber)?.boolValue
     }
 
-    mutating func observations(in directory: URL) throws -> [CaptureObservation] {
+    mutating func observations(in directory: URL, freshMetadata: Set<String> = []) throws -> [CaptureObservation] {
         if cachedDirectory != directory || cachedTimeZone != .current {
             cachedNames.removeAll()
             cachedMetadata.removeAll()
@@ -154,7 +158,9 @@ struct CaptureDirectoryScanner {
             retained[name] = cached
             var metadata: Bool?
             if cached.candidate {
-                if let previous = cachedMetadata[identity], previous.revision == revision { metadata = previous.isScreenCapture }
+                if !freshMetadata.contains(name), let previous = cachedMetadata[identity], previous.revision == revision {
+                    metadata = previous.isScreenCapture
+                }
                 else { metadata = screenCaptureMetadata(url) }
                 if let metadata { retainedMetadata[identity] = CachedMetadata(revision: revision, isScreenCapture: metadata) }
             }
