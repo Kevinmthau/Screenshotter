@@ -31,12 +31,14 @@ private struct SavedSettings: Codable {
     private var queuePolicy = CaptureQueuePolicy()
     private var activeCapture: PendingCapture?
     private var mutationAuthorization: FileMutationAuthorization?
-    private lazy var scans = CaptureScanScheduler(scan: { [files] in try await files.observations(in: $0) },
-                                                  receive: { [weak self] in self?.receivedScan($0) })
+    private lazy var scans = CaptureScanScheduler(scan: { [weak self, files] in
+        try await files.observations(in: $0, freshMetadata: self?.pendingNames ?? [])
+    }, receive: { [weak self] in self?.receivedScan($0) })
     private var maintenance: Task<Void, Never>?
     private var initialization: Task<Void, Never>?
     private var watcher: DirectoryWatcher?
     private var timer: Timer?
+    private var periodicScans = PeriodicScanPolicy()
     private var folder: URL?
     private var folderScope = false
     private var work: Task<Void, Never>?
@@ -131,7 +133,7 @@ private struct SavedSettings: Codable {
             }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+            MainActor.assumeIsolated { self?.tick(periodic: true) }
         }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.tick() }
@@ -158,6 +160,9 @@ private struct SavedSettings: Codable {
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else { return nil }
         return URL(fileURLWithPath: path, isDirectory: true)
     }
+
+    /// Late Spotlight rejection can still cancel these, so their answers are never reused.
+    private var pendingNames: Set<String> { Set(settings.ledger?.pending.map(\.name) ?? []) }
 
     private func chooseFolder() {
         guard !busy, initialization == nil, !fatalPersistenceError else { return }
@@ -299,7 +304,8 @@ private struct SavedSettings: Codable {
 
     private func startWatching() {
         guard let folder else { return }
-        watcher?.stop()
+        // A watcher that failed to restart must read as missing, keeping two-second reconciliation.
+        watcher?.stop(); watcher = nil
         do { watcher = try DirectoryWatcher(url: folder) { [weak self] in self?.tick() } }
         catch { attention = "Filesystem notifications could not start. Folder reconciliation will continue every two seconds." }
     }
@@ -319,7 +325,7 @@ private struct SavedSettings: Codable {
         if available { tick() } else { checkCodex() }
     }
 
-    private func tick() {
+    private func tick(periodic: Bool = false) {
         guard !fatalPersistenceError, !isQuitting, renamer != nil else { return }
         if Date().timeIntervalSince(lastPruned) > 3600, maintenance == nil {
             maintenance = Task { [weak self] in
@@ -339,7 +345,12 @@ private struct SavedSettings: Codable {
             nextConnectionCheck = nil
             checkCodex()
         }
-        guard settings.enabled, let folder, settings.ledger != nil else { render(); return }
+        guard settings.enabled, let folder, let ledger = settings.ledger else { render(); return }
+        // Maintenance and connection checks above run on every tick; only the timer's own scan
+        // backs off while idle. An unreadable folder recovers on its next successful scan, so it
+        // keeps the two-second cadence; each failed scan is cheap.
+        guard periodicScans.shouldScan(periodic: periodic, watching: watcher != nil && !folderUnreadable,
+                                       pending: !ledger.pending.isEmpty) else { return }
         scans.request(folder)
     }
 
@@ -402,7 +413,7 @@ private struct SavedSettings: Codable {
                 }
                 // Reconcile before applying so moves, replacements and paused/resumed sessions
                 // invalidate outstanding submissions even if an old path exists again.
-                let observations = try await self.files.observations(in: folder)
+                let observations = try await self.files.observations(in: folder, freshMetadata: self.pendingNames)
                 self.reconcile(observations)
                 guard !Task.isCancelled, submittedGeneration == self.generation, !self.settings.paused else {
                     self.resetForLater(job.id); return
@@ -436,7 +447,9 @@ private struct SavedSettings: Codable {
                 if error is CancellationError || Task.isCancelled || submittedGeneration != self.generation {
                     self.resetForLater(job.id); return
                 }
-                if let observations = try? await self.files.observations(in: folder) { self.reconcile(observations) }
+                if let observations = try? await self.files.observations(in: folder, freshMetadata: self.pendingNames) {
+                    self.reconcile(observations)
+                }
                 if Task.isCancelled || submittedGeneration != self.generation { self.resetForLater(job.id); return }
                 guard var current = self.settings.ledger?.capture(job.id) else { _ = self.persist(); return }
                 if current.identity != job.identity || current.revision != job.revision {
