@@ -9,6 +9,8 @@ The combined reliability, connection-check, and Sparkle updater changes passed `
 - **33 AppKit UI checks passed**, including 6 new checks for update controls.
 - The **universal arm64 + x86_64 app build passed**, including deep, strict code-signature verification of the app and its nested code.
 
+The same full suite and packaging also passed on [GitHub's macOS 15 runner with Xcode 16.4](https://github.com/Kevinmthau/Screenshotter/actions/runs/36493354000). This caught and fixed an older-SDK compile failure in the subprocess working-directory setup.
+
 These results validate the combined source, local harnesses, and packaged app. An actual Sparkle download and installation from a hosted feed has not yet been tested end to end. The September 21 installed-app and live-service evidence below is historical and does not validate the updater.
 
 ## September 28 reliability update
