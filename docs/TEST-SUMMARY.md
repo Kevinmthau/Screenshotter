@@ -4,12 +4,12 @@
 
 The combined reliability, connection-check, and Sparkle updater changes passed `./scripts/check.sh` locally:
 
-- **112 XCTest cases: 111 passed, 1 opt-in network case skipped, 0 failures.**
+- **114 XCTest cases: 113 passed, 1 opt-in network case skipped, 0 failures.** Current and legacy Codex bundle layouts are covered.
 - **8 filesystem watcher checks passed.**
-- **33 AppKit UI checks passed**, including 6 new checks for update controls.
+- **34 AppKit UI checks passed**, including 7 new checks for menu and window update controls.
 - The **universal arm64 + x86_64 app build passed**, including deep, strict code-signature verification of the app and its nested code.
 
-The same full suite and packaging also passed on [GitHub's macOS 15 runner with Xcode 16.4](https://github.com/Kevinmthau/Screenshotter/actions/runs/36493354000). This caught and fixed an older-SDK compile failure in the subprocess working-directory setup.
+The earlier updater suite and packaging also passed on [GitHub's macOS 15 runner with Xcode 16.4](https://github.com/Kevinmthau/Screenshotter/actions/runs/36493354000). This caught and fixed an older-SDK compile failure in the subprocess working-directory setup.
 
 These results validate the combined source, local harnesses, and packaged app. An actual Sparkle download and installation from a hosted feed has not yet been tested end to end. The September 21 installed-app and live-service evidence below is historical and does not validate the updater.
 

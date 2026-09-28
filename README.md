@@ -24,7 +24,7 @@ Release archives and update feeds carry Sparkle Ed25519 signatures. The app itse
 
 ## Updates
 
-Choose **Check for Updates…** in the menu bar. **Automatically Check for Updates** is on by default and checks daily while the app runs; turn it off from the same menu. When a background check finds a release, the menu shows the available version. Sparkle verifies both the feed and downloaded archive, then asks before installing and restarting. The app saves state and finishes file-operation cleanup before exiting for an update.
+Choose **Check for Updates…** in the menu bar or the **Settings & Preview** window. **Automatically Check for Updates** is on by default and checks daily while the app runs; turn it off from the menu. When a background check finds a release, the menu shows the available version. Sparkle verifies both the feed and downloaded archive, then asks before installing and restarting. The app saves state and finishes file-operation cleanup before exiting for an update.
 
 The updater downloads from this repository's public GitHub Releases. It does not need a GitHub login, and it does not send screenshots or Codex credentials to GitHub. Sparkle system-profile reporting is disabled. Versions before 1.1.0 need one manual installation to gain the updater; subsequent signed releases update in place.
 
@@ -34,7 +34,7 @@ Maintainers: [publishing signed updates](docs/UPDATES.md). Sparkle and its bundl
 
 1. Launch the app from its installed location. Its menu-bar icon opens **Settings & Preview** and **History**; closing the window leaves the menu-bar utility running.
 2. Choose your Desktop folder and allow macOS Desktop access when requested. For an initial test, choose a temporary folder containing representative screenshot copies.
-3. Use **Check Connection** to check Codex. If the app reports that a compatible CLI is required, choose **Locate Codex…** and select `ChatGPT.app`, `Codex.app`, or the `codex` executable. An app selection resolves to its embedded `Contents/Resources/codex` executable. If needed, sign in to Codex through its normal CLI login flow, then check again.
+3. Use **Check Connection** to check Codex. If the app reports that a compatible CLI is required, choose **Locate Codex…** and select `ChatGPT.app`, `Codex.app`, or the `codex` executable. The app finds the bundled CLI in current and older application layouts. If needed, sign in to Codex through its normal CLI login flow, then check again.
 4. Once Codex is connected, read the screenshot-sharing notice and select **Preview Generated Samples**. Scroll down to **PREVIEW** to review the proposed filenames and response times as each of the three samples finishes. The app displays filename results, not the sample images themselves. Preview sends those generated images to OpenAI; it does not access or rename existing Desktop screenshots. You can preview before choosing a folder. If Codex is not connected, clicking Preview shows a message asking you to check the connection.
 5. Acknowledge the notice and choose **Enable Automatic Naming**. Only eligible screenshots saved after activation are processed. Review the preview before enabling; model response time varies.
 6. Optionally select **Open at Login** in the menu after installing. macOS may require approval under System Settings → General → Login Items. While approval is pending, the menu item shows a dash, and choosing it opens that settings page.

@@ -28,6 +28,7 @@ private final class UIVerification {
         let previews: NSStackView = try stored("previewRows", in: ui)
         let segments: NSSegmentedControl = try stored("segments", in: ui)
         let statusItem: NSStatusItem = try stored("statusItem", in: ui)
+        let updateButton: NSButton = try stored("updateButton", in: ui)
         defer { window.orderOut(nil); NSStatusBar.system.removeStatusItem(statusItem) }
         var state = UIState(status: "Watching", isEnabled: true)
         state.history = (0..<200).map { index in
@@ -51,7 +52,7 @@ private final class UIVerification {
         try check(previews.arrangedSubviews[0] === previewRow && statusItem.menu === menu,
                   "detail updates preserve preview rows and the menu")
 
-        try check(statusItem.menu?.item(withTitle: "Check for Updates…")?.isEnabled == false,
+        try check(statusItem.menu?.item(withTitle: "Check for Updates…")?.isEnabled == false && !updateButton.isEnabled,
                   "updater controls stay disabled when no updater is running")
         state.updates = UIUpdateState(isAvailable: true, canCheck: true, automaticallyChecks: true)
         ui.update(state)
@@ -65,10 +66,12 @@ private final class UIVerification {
             updateMenu.performActionForItem(at: updateMenu.index(of: item))
         }
         try check(updateChecks == 1 && updateToggles == 1, "updater menu actions reach their injected handlers")
+        updateButton.performClick(nil)
+        try check(updateButton.isEnabled && updateChecks == 2, "the window's update button invokes the same updater")
         state.updates.canCheck = false
         state.updates.automaticallyChecks = false
         ui.update(state)
-        try check(statusItem.menu?.item(withTitle: "Check for Updates…")?.isEnabled == false &&
+        try check(statusItem.menu?.item(withTitle: "Check for Updates…")?.isEnabled == false && !updateButton.isEnabled &&
                   statusItem.menu?.item(withTitle: "Automatically Check for Updates")?.state == .off,
                   "an active update check disables rechecking without stale menu state")
         state.updates.canCheck = true

@@ -281,7 +281,7 @@ final class CodexAnalyzerTests: XCTestCase {
         }
     }
 
-    func testAppBundleOverrideResolvesEmbeddedCodexAndRejectsDirectories() throws {
+    func testLegacyAppBundleOverrideResolvesEmbeddedCodexAndRejectsDirectories() throws {
         let app = directory.appendingPathComponent("ChatGPT.app")
         let embedded = app.appendingPathComponent("Contents/Resources/codex")
         try FileManager.default.createDirectory(at: embedded.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -291,6 +291,43 @@ final class CodexAnalyzerTests: XCTestCase {
         XCTAssertEqual(try CodexAnalyzer(executableOverride: executable).resolveExecutable(), executable)
         XCTAssertThrowsError(try CodexAnalyzer(executableOverride: directory).resolveExecutable())
         XCTAssertThrowsError(try CodexAnalyzer(executableOverride: directory.appendingPathComponent("Missing.app")).resolveExecutable())
+    }
+
+    func testAppBundleOverrideFindsCurrentLayoutAndPrefersItOverLegacy() async throws {
+        let app = directory.appendingPathComponent("ChatGPT.app")
+        let current = app.appendingPathComponent("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
+        try FileManager.default.createDirectory(at: current.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fakeCodex("exit 0"), to: current)
+        let analyzer = CodexAnalyzer(executableOverride: app)
+        XCTAssertEqual(try analyzer.resolveExecutable(), current)
+        let availability = await analyzer.checkAvailability()
+        XCTAssertEqual(availability, .available(executable: current))
+
+        let legacy = app.appendingPathComponent("Contents/Resources/codex")
+        try FileManager.default.copyItem(at: fakeCodex("exit 0", loginStatus: 1), to: legacy)
+        XCTAssertEqual(try analyzer.resolveExecutable(), current)
+        let availabilityWithLegacy = await analyzer.checkAvailability()
+        XCTAssertEqual(availabilityWithLegacy, .available(executable: current))
+    }
+
+    func testAppBundleOverrideSkipsInvalidCurrentExecutableAndRejectsInvalidBundles() throws {
+        let app = directory.appendingPathComponent("Codex.app")
+        let current = app.appendingPathComponent("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
+        try FileManager.default.createDirectory(at: current, withIntermediateDirectories: true)
+        let legacy = app.appendingPathComponent("Contents/Resources/codex")
+        try FileManager.default.copyItem(at: fakeCodex("exit 0"), to: legacy)
+        let analyzer = CodexAnalyzer(executableOverride: app)
+        XCTAssertEqual(try analyzer.resolveExecutable(), legacy)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: legacy.path)
+        XCTAssertThrowsError(try analyzer.resolveExecutable()) { error in
+            XCTAssertEqual(error as? CodexAnalysisError, .unavailable)
+        }
+        try FileManager.default.removeItem(at: legacy)
+        try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: true)
+        XCTAssertThrowsError(try analyzer.resolveExecutable()) { error in
+            XCTAssertEqual(error as? CodexAnalysisError, .unavailable)
+        }
     }
 
     func testMissingExecutableAndSignedOutStatus() async throws {
