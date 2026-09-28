@@ -47,11 +47,11 @@ releaseWork="$(mktemp -d "${TMPDIR:-/tmp}/screenshot-renamer-publication.XXXXXX"
 trap 'rm -rf "$releaseWork"' EXIT
 
 readLatest() {
-    gh release list --repo "$releaseRepo" --limit 1000 --json tagName,isLatest,isDraft,isPrerelease > "$releaseWork/releases.json"
-    python3 - "$releaseWork/releases.json" "$releaseTag" <<'PY'
+    gh release list --repo "$releaseRepo" --limit 1000 --json tagName,isLatest,isDraft,isPrerelease > "$releaseWork/releases.json" || return
+    python3 - "$releaseWork/releases.json" "$releaseTag" "${1:-}" <<'PY'
 import json, sys
 releases = json.load(open(sys.argv[1]))
-if any(release['tagName'] == sys.argv[2] for release in releases):
+if any(release['tagName'] == sys.argv[2] and not (sys.argv[3] == 'allow-draft' and release['isDraft']) for release in releases):
     raise SystemExit('This tag already has a release, possibly a draft; existing releases are never overwritten.')
 stable = [release for release in releases if not release['isDraft'] and not release['isPrerelease']]
 latest = [release for release in stable if release['isLatest']]
@@ -188,6 +188,8 @@ for name in names:
     if hashlib.sha256((source / name).read_bytes()).digest() != hashlib.sha256((downloaded / name).read_bytes()).digest():
         raise SystemExit('Uploaded asset differs from the verified local file: ' + name)
 PY
+releaseLatestNow="$(readLatest allow-draft)"
+[[ "$releaseLatestNow" == "$releasePrevious" ]] || fail 'The latest release changed while uploading; the new draft was left unpublished.'
 gh release edit "$releaseTag" --repo "$releaseRepo" --draft=false --latest
 # Confirm GitHub exposed the exact commit and signed feed just published.
 releaseRemoteRevision="$(gh api "repos/$releaseRepo/commits/$releaseTag" --jq '.sha')"
