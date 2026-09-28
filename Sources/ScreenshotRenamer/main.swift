@@ -3,6 +3,8 @@ import RenamerCore
 
 @MainActor final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     var controller: AppController?
+    private var updater: AppUpdater?
+    private var terminationTask: Task<Void, Never>?
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let index = CommandLine.arguments.firstIndex(of: "--integration-check"), CommandLine.arguments.count > index + 1 {
             let report = URL(fileURLWithPath: CommandLine.arguments[index + 1])
@@ -12,7 +14,12 @@ import RenamerCore
         let sameApp = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.kevinthau.screenshot-renamer")
             .first { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
         if let sameApp { sameApp.activate(options: []); NSApplication.shared.terminate(nil); return }
-        controller = AppController()
+        // Command-line builds and the integration check must never schedule updates.
+        if Bundle.main.bundleURL.pathExtension == "app" {
+            updater = AppUpdater()
+        }
+        controller = AppController(updater: updater)
+        updater?.start()
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         controller?.showWindow(); return true
@@ -20,7 +27,10 @@ import RenamerCore
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let controller else { return .terminateNow }
-        Task { await controller.stop(); sender.reply(toApplicationShouldTerminate: true) }
+        // Sparkle's Install and Relaunch follows the same drain as a normal Quit.
+        if terminationTask == nil {
+            terminationTask = Task { await controller.stop(); sender.reply(toApplicationShouldTerminate: true) }
+        }
         return .terminateLater
     }
 

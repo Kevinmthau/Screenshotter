@@ -11,7 +11,16 @@ struct UIActions {
     var clearHistory: () -> Void
     var checkCodex: () -> Void
     var chooseCodex: () -> Void
+    var checkForUpdates: () -> Void
+    var toggleAutomaticUpdates: () -> Void
     var quit: () -> Void
+}
+
+struct UIUpdateState: Equatable {
+    var isAvailable = false
+    var canCheck = false
+    var automaticallyChecks = false
+    var availableVersion: String?
 }
 
 struct UIHistoryItem: Equatable {
@@ -40,6 +49,7 @@ struct UIState: Equatable {
     var canEnable = false
     var history: [UIHistoryItem] = []
     var previews: [UIPreviewItem] = []
+    var updates = UIUpdateState()
 }
 
 /// All AppKit and login-item interactions stay on the application's main actor.
@@ -96,6 +106,7 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         let isPaused: Bool
         let isBusy: Bool
         let recent: [UIHistoryItem]
+        let updates: UIUpdateState
     }
 
     init(actions: UIActions) {
@@ -153,7 +164,7 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         let menuState = MenuState(status: state.status, reason: state.status == "Needs attention" ? state.detail : nil,
                                   isEnabled: state.isEnabled,
                                   isPaused: state.isPaused, isBusy: state.isBusy,
-                                  recent: Array(state.history.prefix(5)))
+                                  recent: Array(state.history.prefix(5)), updates: state.updates)
         if menuState != renderedMenu {
             rebuildMenu()
             renderedMenu = menuState
@@ -418,7 +429,7 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         case "Paused": symbol = "pause.circle"
         case "Naming": symbol = "sparkles"
         case "Needs attention": symbol = "exclamationmark.circle"
-        default: symbol = "viewfinder"
+        default: symbol = state.updates.availableVersion == nil ? "viewfinder" : "arrow.down.circle"
         }
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Screenshot Renamer: \(state.status)")
         statusItem.button?.toolTip = "Screenshot Renamer — \(state.status)"
@@ -467,6 +478,15 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         refreshLoginMenuItem()
         menu.addItem(login)
         menu.addItem(.separator())
+        let updateTitle = state.updates.availableVersion.map { "Update Available (\($0))…" } ?? "Check for Updates…"
+        let checkUpdate = menuItem(updateTitle, #selector(checkForUpdates), enabled: state.updates.canCheck)
+        checkUpdate.toolTip = state.updates.isAvailable ? "Check for a newer version of Screenshot Renamer." : "Updates are available in the installed app."
+        menu.addItem(checkUpdate)
+        let automaticUpdates = menuItem("Automatically Check for Updates", #selector(toggleAutomaticUpdates),
+                                        enabled: state.updates.isAvailable)
+        automaticUpdates.state = state.updates.automaticallyChecks ? .on : .off
+        menu.addItem(automaticUpdates)
+        menu.addItem(.separator())
         menu.addItem(menuItem("Quit Screenshot Renamer", #selector(quit), key: "q"))
         statusItem.menu = menu
     }
@@ -482,6 +502,8 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
     @objc private func retry() { actions.retry() }
     @objc private func checkCodex() { actions.checkCodex() }
     @objc private func chooseCodex() { actions.chooseCodex() }
+    @objc private func checkForUpdates() { actions.checkForUpdates() }
+    @objc private func toggleAutomaticUpdates() { actions.toggleAutomaticUpdates() }
     @objc private func quit() { actions.quit() }
     @objc private func clearHistory() { actions.clearHistory() }
     @objc private func consentChanged() { refreshEnablement() }

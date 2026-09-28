@@ -4,6 +4,8 @@ A native macOS menu-bar utility that gives new Desktop screenshots descriptive f
 
 Example: `Screenshot 2026-09-21 at 2.35.10 PM.png` → `Flourish - On-Device AI Notes - 2026-09-21.png`.
 
+[Download the latest release](https://github.com/Kevinmthau/Screenshotter/releases/latest). The app is open source under the [MIT license](LICENSE).
+
 ## Build and install
 
 Requires macOS 13 or later, Xcode Command Line Tools with Swift 6, and an installed Codex CLI with a working saved login and an image-capable configured model. The app searches common locations for Codex; **Locate Codex…** also lets you choose the executable directly or select a Codex or ChatGPT app containing it.
@@ -16,7 +18,17 @@ open "$HOME/Applications/Screenshot Renamer.app"
 
 If the Command Line Tools selection does not include the full Swift/Xcode SDK, prefix build and test commands with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`. No global `xcode-select` change is required.
 
-The build creates `dist/Screenshot Renamer.zip`, containing the app for the current Mac architecture with an ad hoc signature for local use. Packaging as a ZIP protects the signed bundle from metadata added by synced Documents folders. The installer extracts and verifies it in `~/Applications`; you may pass a different Applications directory as its first argument. Quit an existing running copy before reinstalling. Each build has a new ad hoc signature, so after reinstalling macOS may ask again for Desktop access; if the saved folder bookmark no longer resolves, the app continues with the folder's saved path. Afterward, confirm **Open at Login** is still selected in the menu. Distribution signing and notarization are outside this release.
+The build creates `dist/Screenshot Renamer.zip`, containing a universal app for Apple silicon and Intel Macs. Packaging as a ZIP protects the signed bundle from metadata added by synced Documents folders. The installer extracts and verifies it in `~/Applications`; you may pass a different Applications directory as its first argument. Quit an existing running copy before reinstalling. Each build has a new ad hoc signature, so after reinstalling macOS may ask again for Desktop access; if the saved folder bookmark no longer resolves, the app continues with the folder's saved path. Afterward, confirm **Open at Login** is still selected in the menu.
+
+Release archives and update feeds carry Sparkle Ed25519 signatures. The app itself currently uses ad hoc code signing; it is **not Apple Developer ID signed or notarized**, so a first download on another Mac may be blocked by Gatekeeper. Building locally is supported. These update signatures authenticate updates; they do not replace Apple notarization.
+
+## Updates
+
+Choose **Check for Updates…** in the menu bar. **Automatically Check for Updates** is on by default and checks daily while the app runs; turn it off from the same menu. When a background check finds a release, the menu shows the available version. Sparkle verifies both the feed and downloaded archive, then asks before installing and restarting. The app saves state and finishes file-operation cleanup before exiting for an update.
+
+The updater downloads from this repository's public GitHub Releases. It does not need a GitHub login, and it does not send screenshots or Codex credentials to GitHub. Sparkle system-profile reporting is disabled. Versions before 1.1.0 need one manual installation to gain the updater; subsequent signed releases update in place.
+
+Maintainers: [publishing signed updates](docs/UPDATES.md). Sparkle and its bundled dependencies retain their [third-party license notices](THIRD-PARTY-NOTICES.txt).
 
 ## Set up
 
@@ -51,6 +63,8 @@ The app stores `history.json` and `settings.json` in `~/Library/Application Supp
 ## Development and validation
 
 See [the test summary](docs/TEST-SUMMARY.md), [Codex integration evidence](docs/CODEX-INTEGRATION.md), and [the full naming policy](docs/NAMING-POLICY.md) for measured results, safety behavior, and practical limits.
+
+Run `./scripts/check.sh` for unit tests, watcher checks, UI checks, and a verified release build. The same command runs in GitHub Actions for pull requests and `main`; it does not install the app or submit images. Individual commands remain available:
 
 ```sh
 swift test --scratch-path /tmp/screenshot-renamer-tests

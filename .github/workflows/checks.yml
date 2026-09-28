@@ -1,0 +1,33 @@
+name: macOS checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      SCREENSHOT_RENAMER_LIVE_TESTS: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun swift --version
+      - name: Tests and app packaging
+        env:
+          SCREENSHOT_RENAMER_BUILD_PATH: ${{ runner.temp }}/screenshot-renamer-checks
+        run: ./scripts/check.sh

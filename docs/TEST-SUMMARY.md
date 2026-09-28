@@ -1,19 +1,35 @@
 # Validation
 
-## September 28 reliability update (not yet validated)
+## September 28 combined cleanup and updater validation
+
+The combined reliability, connection-check, and Sparkle updater changes passed `./scripts/check.sh` locally:
+
+- **112 XCTest cases: 111 passed, 1 opt-in network case skipped, 0 failures.**
+- **8 filesystem watcher checks passed.**
+- **33 AppKit UI checks passed**, including 6 new checks for update controls.
+- The **universal arm64 + x86_64 app build passed**, including deep, strict code-signature verification of the app and its nested code.
+
+These results validate the combined source, local harnesses, and packaged app. An actual Sparkle download and installation from a hosted feed has not yet been tested end to end. The September 21 installed-app and live-service evidence below is historical and does not validate the updater.
+
+## September 28 reliability update
 
 This update lets the menu-bar app recover from temporary problems without intervention, so it can stay on from login: automatic Codex rechecks with backoff, waiting for the network, a longer retry schedule, keep-original review items for images that cannot be named, recovery from a briefly unreadable folder, and a saved-path fallback when a rebuilt app cannot resolve its folder bookmark. The menu now shows why it needs attention, and **Open at Login** no longer unregisters when macOS approval is pending.
 
-It was written in an environment without macOS or a Swift toolchain, so it has **not been compiled or tested**. Before relying on it, run on the Mac (with the `DEVELOPER_DIR` prefix from the README if needed):
+A [successful macOS CI run on September 28](https://github.com/Kevinmthau/Screenshotter/actions/runs/36484870640) compiled and tested commit `e7cdf04000b3a9ab1b65f488f52b51fd79ae940c`: Swift unit tests, the filesystem watcher harness, and the AppKit UI harness all passed. That temporary workflow did not package or install the app, run live model requests, or validate hosted updates. Its results supersede the earlier statement that the reliability update had not been compiled or tested.
+
+`FailureRecoveryTests` and the updated `CapturePipelineTests` cover the retry schedule, connection-check backoff, and keep-original outcomes. The results in the dated sections below describe earlier releases.
+
+## Repeatable validation
+
+Run all offline checks and build a locally signed app archive with:
 
 ```sh
-swift test --scratch-path /tmp/screenshot-renamer-tests
-./scripts/test-ui.sh
-./scripts/test-watcher.sh
-./scripts/build-app.sh && ./scripts/install.sh
+./scripts/check.sh
 ```
 
-`FailureRecoveryTests` and the updated `CapturePipelineTests` cover the retry schedule, connection-check backoff, and keep-original outcomes. The results below describe earlier releases.
+The script runs Swift unit tests, the filesystem watcher harness, the AppKit UI harness, and `build-app.sh`, including bundle signature verification. It uses a temporary-directory build cache, selects full Xcode for this process if the active Command Line Tools selection lacks XCTest, and leaves app installation and login-item settings untouched. Set `DEVELOPER_DIR` explicitly to use another Xcode installation.
+
+The permanent `.github/workflows/checks.yml` workflow runs the same command on macOS for pull requests, pushes to `main`, and manual dispatches. Live model tests are disabled in CI. Locally, they remain an explicit opt-in through `SCREENSHOT_RENAMER_LIVE_TESTS=1`; this submits generated samples using the saved Codex login. Hosted, signed update delivery requires separate release validation and is not established by these checks.
 
 ## September 22 connection fix
 
@@ -29,11 +45,11 @@ The release build and strict code-signature verification passed, and the updated
 
 ## September 21 validation
 
-Local validation used this Apple Silicon Mac running macOS 27.0, Swift 6.4, and a macOS 13 deployment target. The current release archive, `dist/Screenshot Renamer.zip`, was rebuilt and its bundle passed strict ad hoc code-signature verification. An earlier build remains installed at `~/Applications/Screenshot Renamer.app`. Building and staging in temporary folders avoids Finder metadata added by the synced Documents folder. The installed-app and live-service evidence below predates subsequent review fixes and was not rerun for this cleanup.
+Local validation used this Apple Silicon Mac running macOS 27.0, Swift 6.4, and a macOS 13 deployment target. The release archive at that time, `dist/Screenshot Renamer.zip`, was rebuilt and its bundle passed strict ad hoc code-signature verification. An earlier build remained installed at `~/Applications/Screenshot Renamer.app`. Building and staging in temporary folders avoids Finder metadata added by the synced Documents folder. The installed-app and live-service evidence below predates subsequent review fixes and was not rerun for the September 28 cleanup.
 
-## Automated and runtime results
+### Historical automated and runtime results
 
-**101 XCTest cases: 100 passed, 1 opt-in network case skipped, 0 failures.** These local results include the pipeline, file-transaction, connection-check, and integration-report regressions below. Earlier live generated-sample and installed-app runs are recorded separately; they do not validate the current revision against the service.
+**101 XCTest cases: 100 passed, 1 opt-in network case skipped, 0 failures.** These earlier local results include the pipeline, file-transaction, connection-check, and integration-report regressions below. Earlier live generated-sample and installed-app runs are recorded separately; they do not validate the combined September 28 revision against the service.
 
 - Safe file operations: collisions, exclusive no-overwrite rename, byte preservation, exact extension preservation, changed contents (including same size and restored modification time), replacement identity, manual move/deletion, symlinks, occupied Undo destination, modified Undo source, concurrent journal instances, durable rename/Undo recovery, corrupt journal rejection, journal-write failure, 30-day pruning, and Clear History.
 - Eligibility and queue: activation baseline, old captures, manual names, non-image downloads, recordings, duplicate events, own renames, bounded capacity of 64, editor replacements, stability delay, pending recovery, moved originals with same-path replacements, retry scheduling, expired pending filenames, and late metadata rejection.
@@ -55,7 +71,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/test-ui.sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/build-app.sh
 ```
 
-## Earlier installed-app integration
+### Historical installed-app integration
 
 The earlier installed build was launched through LaunchServices with `--integration-check`. Saved ChatGPT authentication and CLI discovery worked without a shell profile or this conversation. Three generated screens were analyzed, renamed in a temporary directory, and undone. All three preserved SHA-256 content fingerprints through both operations. See `installed-app-check.json` for the captured report. This run predates the current integration-report regression coverage.
 
@@ -69,7 +85,7 @@ Mean measured analysis latency was 4.94 seconds, plus at least two seconds of sa
 
 A separate actual-CLI signed-out test used an empty temporary authentication home and returned an actionable authentication error without changing the saved login. A local mock-provider audit of the installed CLI's outgoing request confirmed `tools: []`. Offline and quota cases used controlled failures; the test did not change network settings or consume a reset credit. More detail is in `CODEX-INTEGRATION.md`.
 
-The installed native interface was inspected through accessibility and screenshots. Connection status, generated preview results, privacy checkbox, disabled automatic activation before consent, History, and initial setup rendered correctly. The chosen Desktop bookmark resolved after replacing and reopening the app. Automatic naming remains disabled, and no existing Desktop file was renamed. Open at Login remains off.
+The installed native interface was inspected through accessibility and screenshots. Connection status, generated preview results, privacy checkbox, disabled automatic activation before consent, History, and initial setup rendered correctly. The chosen Desktop bookmark resolved after replacing and reopening the app. Automatic naming remained disabled, and no existing Desktop file was renamed. Open at Login was left off.
 
 ## Practical limits and remaining user checks
 
