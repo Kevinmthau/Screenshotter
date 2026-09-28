@@ -101,13 +101,55 @@ public struct CaptureQueuePolicy: Sendable {
         ledger.update(job)
     }
 
-    public func fail(_ job: inout PendingCapture, with error: CodexAnalysisError) -> Bool {
-        if error.isRetryable && job.attempts < 3 {
+    /// How the controller continues after a naming attempt fails.
+    public enum FailureOutcome: Equatable, Sendable {
+        /// The capture is retried automatically at its `nextAttempt`.
+        case retryScheduled
+        /// Codex needs sign-in, usage, or a compatible CLI. The capture resumes after the
+        /// next successful connection check rather than on its own timer.
+        case awaitingConnection
+        /// Another attempt cannot produce a usable name; keep the original filename for review.
+        case keepOriginal
+        /// Automatic attempts are exhausted; Retry Pending is required.
+        case failed
+    }
+
+    /// Delays after attempts 1 through 5. Together they cover sleep, network changes and short
+    /// service interruptions (about 50 minutes) without resubmitting an image indefinitely.
+    static let retryDelays: [TimeInterval] = [15, 60, 300, 900, 1800]
+    static let maximumAttempts = 6
+    /// Unreadable images and invalid model answers are retried twice, then keep their name.
+    static let maximumContentAttempts = 3
+
+    /// Every submission counts toward the attempt limit, including ones that wait for a
+    /// connection, so a misclassified failure cannot hold the queue indefinitely.
+    public func fail(_ job: inout PendingCapture, with error: CodexAnalysisError) -> FailureOutcome {
+        let attempt = max(job.attempts, 1)
+        switch error {
+        case .authenticationRequired, .quotaExceeded, .unavailable:
+            guard attempt < Self.maximumAttempts else { job.state = .failed; return .failed }
             job.state = .retry
-            job.nextAttempt = now().addingTimeInterval(job.attempts == 1 ? 15 : 60)
-            return true
+            job.nextAttempt = .distantPast
+            return .awaitingConnection
+        case .invalidImage, .invalidResponse:
+            guard attempt < Self.maximumContentAttempts else { job.state = .failed; return .keepOriginal }
+        case .offline, .transientFailure, .timedOut:
+            guard attempt < Self.maximumAttempts else { job.state = .failed; return .failed }
         }
-        job.state = .failed
-        return false
+        job.state = .retry
+        job.nextAttempt = now().addingTimeInterval(Self.retryDelays[min(attempt, Self.retryDelays.count) - 1])
+        return .retryScheduled
+    }
+
+    /// Delay before the next automatic connection check after Codex stopped accepting work.
+    /// A check runs `codex exec --help` and `codex login status` locally; it never submits an image.
+    public static func connectionCheckDelay(after error: CodexAnalysisError, consecutiveFailures: Int) -> TimeInterval {
+        let schedule: [TimeInterval]
+        switch error {
+        case .quotaExceeded: schedule = [1800, 3600]
+        case .authenticationRequired, .unavailable: schedule = [60, 120, 300, 600, 900]
+        case .offline, .transientFailure, .timedOut, .invalidResponse, .invalidImage: schedule = [15, 30, 60, 120, 300]
+        }
+        return schedule[min(max(consecutiveFailures, 1), schedule.count) - 1]
     }
 }

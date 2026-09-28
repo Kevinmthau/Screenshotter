@@ -1,5 +1,20 @@
 # Validation
 
+## September 28 reliability update (not yet validated)
+
+This update lets the menu-bar app recover from temporary problems without intervention, so it can stay on from login: automatic Codex rechecks with backoff, waiting for the network, a longer retry schedule, keep-original review items for images that cannot be named, recovery from a briefly unreadable folder, and a saved-path fallback when a rebuilt app cannot resolve its folder bookmark. The menu now shows why it needs attention, and **Open at Login** no longer unregisters when macOS approval is pending.
+
+It was written in an environment without macOS or a Swift toolchain, so it has **not been compiled or tested**. Before relying on it, run on the Mac (with the `DEVELOPER_DIR` prefix from the README if needed):
+
+```sh
+swift test --scratch-path /tmp/screenshot-renamer-tests
+./scripts/test-ui.sh
+./scripts/test-watcher.sh
+./scripts/build-app.sh && ./scripts/install.sh
+```
+
+`FailureRecoveryTests` and the updated `CapturePipelineTests` cover the retry schedule, connection-check backoff, and keep-original outcomes. The results below describe earlier releases.
+
 ## September 22 connection fix
 
 Selecting `ChatGPT.app` or `Codex.app` through **Locate Codex…** now resolves the embedded `Contents/Resources/codex` executable. Previously saved app-bundle selections are also supported. Executable validation rejects directories, and clicking Preview before connecting Codex now displays an actionable message.
