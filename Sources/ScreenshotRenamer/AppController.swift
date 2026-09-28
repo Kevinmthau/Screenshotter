@@ -223,7 +223,8 @@ private struct SavedSettings: Codable {
     private func connectionLost(_ error: CodexAnalysisError, duringNaming: Bool) {
         available = false
         connectionIssue = error
-        connectionIssueFromNaming = duringNaming
+        // A later failed check (for example a timeout) does not settle a naming problem.
+        if duringNaming { connectionIssueFromNaming = true }
         codexStatus = error.isRetryable ? "Codex did not respond. Checking again automatically." : error.localizedDescription
         connectionFailures += 1
         nextConnectionCheck = Date().addingTimeInterval(
@@ -313,7 +314,8 @@ private struct SavedSettings: Codable {
 
     private func retry() {
         guard !fatalPersistenceError, !isQuitting else { return }
-        settings.ledger?.retryFailures(); attention = nil; connectionFailures = 0; _ = persist()
+        settings.ledger?.retryFailures(); attention = nil; connectionFailures = 0; connectionIssueFromNaming = false
+        _ = persist()
         if available { tick() } else { checkCodex() }
     }
 
@@ -424,7 +426,8 @@ private struct SavedSettings: Codable {
                                          reason: "image needs review")
                 }
                 self.settings.ledger?.finish(job.id)
-                self.attention = nil; self.connectionFailures = 0; _ = self.persist()
+                self.attention = nil; self.connectionFailures = 0; self.connectionIssueFromNaming = false
+                _ = self.persist()
             } catch {
                 // A post-rename journal failure must still stop processing if Pause
                 // arrived while the background transaction was completing.
