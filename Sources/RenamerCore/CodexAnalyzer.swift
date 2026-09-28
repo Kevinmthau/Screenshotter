@@ -449,11 +449,10 @@ private final class CLIProcess: @unchecked Sendable {
         posix_spawn_file_actions_adddup2(&actions, err[1], STDERR_FILENO)
         posix_spawn_file_actions_addclose(&actions, out[0]); posix_spawn_file_actions_addclose(&actions, err[0])
         posix_spawn_file_actions_addclose(&actions, out[1]); posix_spawn_file_actions_addclose(&actions, err[1])
-        if #available(macOS 26.0, *) {
-            posix_spawn_file_actions_addchdir(&actions, directory.path)
-        } else {
-            posix_spawn_file_actions_addchdir_np(&actions, directory.path)
-        }
+        // The equivalent POSIX spelling is absent from pre-macOS-26 SDKs even
+        // inside an availability check. This API supports our macOS 13 target
+        // and lets contributors build with older Swift 6/Xcode SDKs.
+        posix_spawn_file_actions_addchdir_np(&actions, directory.path)
         posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
         posix_spawnattr_setpgroup(&attributes, 0)
         let argv = ([executable.path] + arguments).map { strdup($0) } + [nil]
