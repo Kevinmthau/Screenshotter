@@ -24,6 +24,8 @@ printf 'Running filesystem watcher checks…\n'
 "$checkSourceRoot/scripts/test-watcher.sh"
 printf 'Running AppKit UI checks…\n'
 "$checkSourceRoot/scripts/test-ui.sh"
+printf 'Running automatic startup checks…\n'
+"$checkSourceRoot/scripts/test-startup.sh"
 printf 'Building and verifying the app bundle…\n'
 "$checkSourceRoot/scripts/build-app.sh"
 printf 'All checks passed. The app has not been installed or launched.\n'

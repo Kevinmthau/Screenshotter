@@ -1,5 +1,32 @@
 # Validation
 
+## October 2 automatic startup and updater integration
+
+The automatic startup change was integrated with the newer remote main, retaining automatic connection recovery, current Codex bundle discovery, and the Sparkle updater with its signed feed configuration. The app now starts naming new screenshots without preview or enable controls, and the installer launches it. Version **1.1.1 (build 3)** identifies this local development revision; it has not been published as a hosted release.
+
+The combined revision passed `./scripts/check.sh` locally:
+
+- **114 XCTest cases: 113 passed, 1 opt-in network case skipped, 0 failures.**
+- **8 real filesystem watcher checks passed.**
+- **44 AppKit UI checks passed**, preserving updater controls and attention explanations alongside the simplified Settings flow.
+- **23 startup checks passed**, covering automatic naming, existing files, disabled legacy migrations, persistent Pause/Resume, connection and folder recovery, and updater isolation. The harness uses an offline CLI, isolated settings, and disabled network monitoring; no model calls, login-item changes, or update checks run.
+- The **universal arm64 + x86_64 build passed**, including deep, strict code-signature verification of the app and nested Sparkle code.
+
+The combined build was not installed or published, and live model tests remained disabled. Results below distinguish the earlier installed simplification build from the remote updater release validation.
+
+### Earlier local startup validation (before integration)
+
+The installer now launches the installed app. A normal launch uses the Desktop by default, checks Codex, and starts automatic naming without a preview or enable step. Settings retains folder and connection recovery controls, with Pause, History, and Undo available from the menu. Open at Login is requested once by default, and subsequent launches respect the user's choice. Generated sample checks remain available through the developer-only `--integration-check` mode.
+
+The local release-mode build, installer shell syntax, Info.plist validation, and strict installed code-signature verification passed. Those checks completed with:
+
+- **97 XCTest cases: 96 passed, 1 opt-in network case skipped, 0 failures.**
+- **35 UI checks passed**, including removal of preview/enable/consent controls and startup Retry availability.
+- **22 startup checks passed**, covering fresh and disabled legacy installations, automatic naming, existing-file preservation, saved folder/baseline recovery, Pause/Resume across relaunch, missing Codex, and folder-access Retry recovery. These checks use temporary files and an offline CLI fixture; they do not submit images or change login items.
+- **8 real FSEvents watcher checks passed** across 9 callback batches.
+
+A local development build numbered **1.1.0 (build 2)** from the simplification-only tree was installed at `~/Applications/Screenshot Renamer.app` and launched automatically by the installer. The running process retained the Desktop folder, original activation time, and enabled/unpaused settings. Preview fields were removed from the saved settings. macOS background-item records reported Open at Login as enabled and allowed. An actual login-session relaunch was not tested. Native UI inspection of this installed update was unavailable because Computer Use permission was not granted; the UI checks above exercised the production AppKit views with synthetic state. These checks predate integration with remote main and do not validate the combined updater and startup revision.
+
 ## September 28 combined cleanup and updater validation
 
 The combined reliability, connection-check, and Sparkle updater changes passed `./scripts/check.sh` locally:
@@ -42,7 +69,9 @@ Run all offline checks and build a locally signed app archive with:
 ./scripts/check.sh
 ```
 
-The script runs Swift unit tests, the filesystem watcher harness, the AppKit UI harness, and `build-app.sh`, including bundle signature verification. It uses a temporary-directory build cache, selects full Xcode for this process if the active Command Line Tools selection lacks XCTest, and leaves app installation and login-item settings untouched. Set `DEVELOPER_DIR` explicitly to use another Xcode installation.
+The script runs Swift unit tests, the filesystem watcher harness, the AppKit UI harness, the automatic startup harness, and `build-app.sh`, including bundle signature verification. It uses a temporary-directory build cache, selects full Xcode for this process if the active Command Line Tools selection lacks XCTest, and leaves app installation and login-item settings untouched. Set `DEVELOPER_DIR` explicitly to use another Xcode installation.
+
+Run `./scripts/test-startup.sh` separately for automatic startup, migration, folder recovery, and Pause/Resume checks. It uses temporary settings, generated fixture images, and an offline CLI fixture; it does not change the installed app or login-item registration.
 
 The permanent `.github/workflows/checks.yml` workflow runs the same command on macOS for pull requests, pushes to `main`, and manual dispatches. Live model tests are disabled in CI. Locally, they remain an explicit opt-in through `SCREENSHOT_RENAMER_LIVE_TESTS=1`; this submits generated samples using the saved Codex login. Hosted, signed update delivery requires separate release validation and is not established by these checks.
 
@@ -100,16 +129,16 @@ Mean measured analysis latency was 4.94 seconds, plus at least two seconds of sa
 
 A separate actual-CLI signed-out test used an empty temporary authentication home and returned an actionable authentication error without changing the saved login. A local mock-provider audit of the installed CLI's outgoing request confirmed `tools: []`. Offline and quota cases used controlled failures; the test did not change network settings or consume a reset credit. More detail is in `CODEX-INTEGRATION.md`.
 
-The installed native interface was inspected through accessibility and screenshots. Connection status, generated preview results, privacy checkbox, disabled automatic activation before consent, History, and initial setup rendered correctly. The chosen Desktop bookmark resolved after replacing and reopening the app. Automatic naming remained disabled, and no existing Desktop file was renamed. Open at Login was left off.
+During the September 21 validation, the installed native interface was inspected through accessibility and screenshots. Connection status, generated preview results, privacy checkbox, disabled automatic activation before consent, History, and initial setup rendered correctly. The chosen Desktop bookmark resolved after replacing and reopening the app. Automatic naming and Open at Login were left disabled during that check, and no existing Desktop file was renamed.
 
 ## Practical limits and remaining user checks
 
 - Validation was performed on this Mac, not on a separate macOS 13 machine. The deployment target and API availability are checked by compilation.
-- Actual login-session relaunch has not been tested because Open at Login was intentionally left off. The app uses Apple's `SMAppService.mainApp` mechanism; enable it only when desired.
+- Actual login-session relaunch has not been tested. The app uses Apple's `SMAppService.mainApp` mechanism and requests Open at Login on first launch; the menu can disable it.
 - English macOS screenshot names are supported in this first release. Customized or localized default filenames are conservatively excluded.
-- Pause and shutdown invalidate outstanding work before rename and cancel the local child process; already submitted images cannot be recalled. The child-process cancellation is tested, while active Desktop capture/pause/wake behavior remains a user acceptance check after enabling.
+- Pause and shutdown invalidate outstanding work before rename and cancel the local child process; already submitted images cannot be recalled. The child-process cancellation is tested, while active Desktop capture/pause/wake behavior remains a user acceptance check.
 - Destination no-overwrite is atomic. macOS does not provide a source-inode-conditioned rename; the implementation rechecks identity and content immediately before and after rename and attempts exclusive rollback on a race. Another process mutating the same file at the exact system-call boundary cannot be excluded absolutely.
-- Model naming quality and privacy instructions were validated on generated examples, not on the user's private screenshots. Review the preview before enabling future Desktop capture processing.
+- Model naming quality and privacy instructions were validated on generated examples, not on the user's private screenshots.
 
 ## References
 

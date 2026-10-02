@@ -17,7 +17,7 @@ private final class UIVerification {
     func run() throws {
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.prohibited)
-        let ui = AppUI(actions: UIActions(chooseFolder: {}, preview: {}, enable: {}, togglePause: {}, retry: {},
+        let ui = AppUI(actions: UIActions(chooseFolder: {}, togglePause: {}, retry: {},
                                           undo: { [weak self] in self?.undone = $0 }, clearHistory: {},
                                           checkCodex: {}, chooseCodex: {},
                                           checkForUpdates: { [weak self] in self?.updateChecks += 1 },
@@ -25,32 +25,65 @@ private final class UIVerification {
         // Read the view references without adding a test-only API to AppUI.
         let window: NSWindow = try stored("window", in: ui)
         let history: NSStackView = try stored("historyRows", in: ui)
-        let previews: NSStackView = try stored("previewRows", in: ui)
+        let suggestions: NSStackView = try stored("suggestionRows", in: ui)
         let segments: NSSegmentedControl = try stored("segments", in: ui)
         let statusItem: NSStatusItem = try stored("statusItem", in: ui)
         let updateButton: NSButton = try stored("updateButton", in: ui)
         defer { window.orderOut(nil); NSStatusBar.system.removeStatusItem(statusItem) }
+        let controls = descendants(of: window.contentView!).compactMap { $0 as? NSButton }
+        try check(!controls.contains { button in
+            let title = button.title.lowercased()
+            return title.contains("preview") || title.contains("enable automatic") || title.contains("i understand")
+        }, "Settings has no preview, enable, or consent controls")
+        try check(segments.label(forSegment: 0) == "Settings", "Settings replaces the setup workflow")
+        try check(statusItem.menu?.items.contains { $0.title == "Settings…" } == true &&
+                  statusItem.menu?.items.contains { $0.title.lowercased().contains("preview") } == false,
+                  "menu opens Settings without a preview step")
+        try check(descendants(of: window.contentView!).contains {
+            ($0 as? NSTextField)?.stringValue.contains("sent to OpenAI through Codex using your saved login") == true
+        }, "Settings explains automatic screenshot sharing")
+        let retry: NSButton = try stored("retryButton", in: ui)
+        var startupFailure = UIState(status: "Needs attention", detail: "Desktop access needs to be restored.")
+        ui.update(startupFailure)
+        try check(retry.isEnabled && retry.title == "Retry" &&
+                  statusItem.menu?.items.contains { $0.title == "Retry Automatic Naming" && $0.isEnabled } == true,
+                  "startup failure can retry automatic naming before a baseline exists")
+        try check(statusItem.menu?.item(withTitle: startupFailure.detail)?.toolTip == startupFailure.detail,
+                  "Needs attention explains the startup failure directly in the menu")
+        startupFailure.detail = "Desktop access was denied. Restore it in System Settings, then retry automatic naming to start watching new screenshots."
+        ui.update(startupFailure)
+        try check(statusItem.menu?.item(withTitle: "Desktop access was denied.")?.toolTip == startupFailure.detail,
+                  "changed attention details refresh the shortened menu explanation and full tooltip")
+        startupFailure.isBusy = true
+        ui.update(startupFailure)
+        try check(!retry.isEnabled &&
+                  statusItem.menu?.items.contains { $0.title == "Retry Automatic Naming" && !$0.isEnabled } == true,
+                  "startup retry stays disabled during work or connection checking")
+        startupFailure.isBusy = false
+        startupFailure.isPaused = true
+        ui.update(startupFailure)
+        try check(!retry.isEnabled, "paused startup state cannot retry")
         var state = UIState(status: "Watching", isEnabled: true)
         state.history = (0..<200).map { index in
             UIHistoryItem(id: UUID(), original: "Screenshot \(index).png", renamed: "Generated Name \(index).png",
                           date: Date(timeIntervalSince1970: Double(1_750_000_000 - index)), state: "renamed", canUndo: true)
         }
-        state.previews = [UIPreviewItem(original: "Sample.png", proposed: "Sample Preview.png", details: "Generated sample")]
+        state.suggestions = [UICaptureSuggestion(original: "Screenshot.png", proposed: "Review Name.png", details: "Needs review")]
         ui.update(state)
-        try check(history.arrangedSubviews.isEmpty && previews.arrangedSubviews.isEmpty,
+        try check(history.arrangedSubviews.isEmpty && suggestions.arrangedSubviews.isEmpty,
                   "closed window defers row construction")
 
         window.setFrameOrigin(NSPoint(x: -10000, y: -10000))
         window.orderFront(nil)
         ui.update(state)
-        try check(previews.arrangedSubviews.count == 1 && history.arrangedSubviews.isEmpty,
-                  "opening Setup renders previews and leaves History deferred")
-        let previewRow = previews.arrangedSubviews[0]
+        try check(suggestions.arrangedSubviews.count == 1 && history.arrangedSubviews.isEmpty,
+                  "opening Settings renders suggestions and leaves History deferred")
+        let suggestionRow = suggestions.arrangedSubviews[0]
         let menu = statusItem.menu
         state.detail = "An unrelated status detail"
         ui.update(state)
-        try check(previews.arrangedSubviews[0] === previewRow && statusItem.menu === menu,
-                  "detail updates preserve preview rows and the menu")
+        try check(suggestions.arrangedSubviews[0] === suggestionRow && statusItem.menu === menu,
+                  "detail updates preserve suggestion rows and the menu")
 
         try check(statusItem.menu?.item(withTitle: "Check for Updates…")?.isEnabled == false && !updateButton.isEnabled,
                   "updater controls stay disabled when no updater is running")
@@ -122,7 +155,7 @@ private final class UIVerification {
         try check(detail.stringValue == "\(expectedFormatter.string(from: state.history[0].date)) · \(state.history[0].state)" &&
                   history.arrangedSubviews[0] === originalRows[0],
                   "selecting History applies current locale to reused rows")
-        try check(previews.arrangedSubviews[0] === previewRow, "date-format changes preserve unrelated preview rows")
+        try check(suggestions.arrangedSubviews[0] === suggestionRow, "date-format changes preserve unrelated suggestion rows")
         for index in 0..<20 {
             state.isBusy = index.isMultiple(of: 2)
             state.detail = "Naming state \(index)"
@@ -168,14 +201,19 @@ private final class UIVerification {
         try check(history.arrangedSubviews.count == 200 && addedRow.superview == nil,
                   "removed history detaches only its row")
 
-        state.previews[0].proposed = "Changed while hidden.png"
+        state.suggestions[0].proposed = "Changed while hidden.png"
         ui.update(state)
-        try check(previews.arrangedSubviews[0] === previewRow, "hidden Preview defers changed content")
+        try check(suggestions.arrangedSubviews[0] === suggestionRow, "hidden Settings defers changed content")
         segments.selectedSegment = 0
         segments.sendAction(segments.action!, to: segments.target)
-        try check(previews.arrangedSubviews[0] !== previewRow &&
-                  descendants(of: previews).contains { ($0 as? NSTextField)?.stringValue == "Changed while hidden.png" },
-                  "selecting Preview applies its latest content")
+        try check(suggestions.arrangedSubviews[0] !== suggestionRow &&
+                  descendants(of: suggestions).contains { ($0 as? NSTextField)?.stringValue == "Changed while hidden.png" },
+                  "selecting Settings applies its latest content")
+        state.suggestions.removeAll()
+        ui.update(state)
+        try check(suggestions.arrangedSubviews.count == 1 && descendants(of: suggestions).contains {
+            ($0 as? NSTextField)?.stringValue.contains("Screenshots that need your review") == true
+        }, "Settings explains the empty review state")
         state.history.removeAll()
         ui.update(state)
         try check(history.arrangedSubviews.count == 200, "hidden History defers removal")

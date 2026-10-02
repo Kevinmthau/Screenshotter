@@ -3,8 +3,6 @@ import ServiceManagement
 
 struct UIActions {
     var chooseFolder: () -> Void
-    var preview: () -> Void
-    var enable: () -> Void
     var togglePause: () -> Void
     var retry: () -> Void
     var undo: (UUID) -> Void
@@ -32,7 +30,7 @@ struct UIHistoryItem: Equatable {
     var canUndo: Bool
 }
 
-struct UIPreviewItem: Equatable {
+struct UICaptureSuggestion: Equatable {
     var original: String
     var proposed: String
     var details: String
@@ -40,15 +38,14 @@ struct UIPreviewItem: Equatable {
 
 struct UIState: Equatable {
     var status = "Needs attention"
-    var detail = "Choose your Desktop folder, connect Codex, and preview a few names to get started."
+    var detail = "Checking your Desktop and saved Codex login…"
     var folder: String?
     var codexStatus = "Codex has not been checked."
     var isEnabled = false
     var isPaused = false
     var isBusy = false
-    var canEnable = false
     var history: [UIHistoryItem] = []
-    var previews: [UIPreviewItem] = []
+    var suggestions: [UICaptureSuggestion] = []
     var updates = UIUpdateState()
 }
 
@@ -63,19 +60,16 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
     private let detailLabel = NSTextField(wrappingLabelWithString: "")
     private let folderLabel = NSTextField(wrappingLabelWithString: "No folder selected")
     private let codexLabel = NSTextField(wrappingLabelWithString: "Codex has not been checked.")
-    private let consent = NSButton(checkboxWithTitle: "I understand that screenshots are sent to OpenAI.", target: nil, action: nil)
-    private let previewButton = NSButton(title: "Preview Generated Samples", target: nil, action: nil)
-    private let enableButton = NSButton(title: "Enable Automatic Naming", target: nil, action: nil)
     private let pauseButton = NSButton(title: "Pause", target: nil, action: nil)
     private let retryButton = NSButton(title: "Retry Pending", target: nil, action: nil)
     private let clearButton = NSButton(title: "Clear History", target: nil, action: nil)
     private let updateButton = NSButton(title: "Check for Updates…", target: nil, action: nil)
-    private let previewRows = NSStackView()
+    private let suggestionRows = NSStackView()
     private let historyRows = NSStackView()
-    private var setupPane: NSScrollView!
+    private var settingsPane: NSScrollView!
     private var historyPane: NSView!
     private var segments: NSSegmentedControl!
-    private var renderedPreviews: [UIPreviewItem]?
+    private var renderedSuggestions: [UICaptureSuggestion]?
     private var renderedHistory: [UIHistoryItem]?
     private var renderedHistoryBusy: Bool?
     private var historyDatesNeedRefresh = false
@@ -154,13 +148,11 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         detailLabel.stringValue = state.detail
         folderLabel.stringValue = state.folder ?? "Select the Desktop folder you want to watch."
         codexLabel.stringValue = state.codexStatus
-        previewButton.isEnabled = !state.isBusy
-        enableButton.title = state.isEnabled ? "Automatic Naming Enabled" : "Enable Automatic Naming"
-        refreshEnablement()
         pauseButton.title = state.isPaused ? "Resume" : "Pause"
         pauseButton.isEnabled = state.isEnabled
-        retryButton.isEnabled = state.isEnabled && !state.isBusy && !state.isPaused
-        clearButton.isEnabled = (!state.history.isEmpty || !state.previews.isEmpty) && !state.isBusy
+        retryButton.title = state.isEnabled ? "Retry Pending" : "Retry"
+        retryButton.isEnabled = canRetry
+        clearButton.isEnabled = (!state.history.isEmpty || !state.suggestions.isEmpty) && !state.isBusy
         updateButton.isEnabled = state.updates.canCheck
         refreshVisibleRows()
         let menuState = MenuState(status: state.status, reason: state.status == "Needs attention" ? state.detail : nil,
@@ -177,9 +169,9 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
     /// retained while the window is closed or its other pane is selected.
     private func refreshVisibleRows() {
         guard window.isVisible, !window.isMiniaturized else { return }
-        if !setupPane.isHidden, renderedPreviews != state.previews {
-            rebuildPreviews()
-            renderedPreviews = state.previews
+        if !settingsPane.isHidden, renderedSuggestions != state.suggestions {
+            rebuildSuggestions()
+            renderedSuggestions = state.suggestions
         }
         if !historyPane.isHidden {
             if renderedHistory != state.history {
@@ -241,16 +233,16 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         statusRow.alignment = .centerY
         let statusCard = card(statusRow, inset: 16)
 
-        segments = NSSegmentedControl(labels: ["Setup & Preview", "History"], trackingMode: .selectOne, target: self, action: #selector(changePane))
+        segments = NSSegmentedControl(labels: ["Settings", "History"], trackingMode: .selectOne, target: self, action: #selector(changePane))
         segments.selectedSegment = 0
         segments.segmentStyle = .rounded
         let segmentRow = horizontal([segments, spacer()], spacing: 0)
 
-        setupPane = scrollView(document: makeSetup())
+        settingsPane = scrollView(document: makeSettings())
         historyPane = makeHistory()
         historyPane.isHidden = true
         let content = NSView()
-        for pane in [setupPane!, historyPane!] {
+        for pane in [settingsPane!, historyPane!] {
             content.addSubview(pane)
             pin(pane, to: content)
         }
@@ -267,50 +259,39 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         content.heightAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
     }
 
-    private func makeSetup() -> NSView {
+    private func makeSettings() -> NSView {
         folderLabel.font = .systemFont(ofSize: 12)
         folderLabel.textColor = .secondaryLabelColor
         folderLabel.lineBreakMode = .byTruncatingMiddle
         folderLabel.maximumNumberOfLines = 2
         folderLabel.isSelectable = true
         let choose = button("Choose Folder…", #selector(chooseFolder))
-        let folder = setupStep(number: "1", title: "Choose your Desktop", description: folderLabel, controls: [choose])
+        let folder = settingsSection(title: "Screenshot folder", description: folderLabel, controls: [choose])
 
         codexLabel.font = .systemFont(ofSize: 12)
         codexLabel.textColor = .secondaryLabelColor
         codexLabel.maximumNumberOfLines = 3
-        let codex = setupStep(number: "2", title: "Connect Codex", description: codexLabel,
-                              controls: [button("Check Connection", #selector(checkCodex)), button("Locate Codex…", #selector(chooseCodex))])
+        let codex = settingsSection(title: "Codex connection", description: codexLabel,
+                                   controls: [button("Check Connection", #selector(checkCodex)), button("Locate Codex…", #selector(chooseCodex))])
 
-        let privacy = wrapping("Preview sends three generated sample images to OpenAI through Codex using your existing login. After you enable automatic naming, new screenshots in your selected folder are also sent to OpenAI. Review sensitive screenshots before enabling.")
+        let privacy = wrapping("New screenshots in your selected folder are sent to OpenAI through Codex using your saved login. Automatic naming starts when Screenshot Renamer opens. Pause it at any time from the menu bar.")
         let retention = wrapping("Filename history is stored on this Mac for 30 days. You can clear it at any time. Local cleanup does not control OpenAI’s service-side data policies.", size: 11)
         retention.textColor = .secondaryLabelColor
-        wire(consent, #selector(consentChanged))
-        consent.font = .systemFont(ofSize: 12)
-        wire(previewButton, #selector(preview))
-        wire(enableButton, #selector(enable))
-        enableButton.bezelColor = .controlAccentColor
-        let buttons = horizontal([previewButton, enableButton, spacer()], spacing: 10)
-        let previewIntro = wrapping("Review proposed names and response times using three generated sample images. The preview does not access or rename your Desktop screenshots.", size: 12)
-        previewIntro.textColor = .secondaryLabelColor
-        let enableSection = vertical([
-            label("3  Preview, then enable", size: 14, weight: .semibold),
-            previewIntro, privacy, retention, consent, buttons
-        ], spacing: 10)
-        fillWidth(enableSection, excluding: [consent])
+        let privacySection = vertical([label("Screenshot privacy", size: 14, weight: .semibold), privacy, retention], spacing: 10)
+        fillWidth(privacySection)
 
-        previewRows.orientation = .vertical
-        previewRows.alignment = .leading
-        previewRows.spacing = 12
-        let previewSection = vertical([label("PREVIEW", size: 10, weight: .semibold, color: .secondaryLabelColor), previewRows], spacing: 10)
-        fillWidth(previewSection)
-        let stack = vertical([folder, codex, card(enableSection, inset: 16), previewSection], spacing: 20)
+        suggestionRows.orientation = .vertical
+        suggestionRows.alignment = .leading
+        suggestionRows.spacing = 12
+        let suggestionSection = vertical([label("Needs review", size: 14, weight: .semibold), suggestionRows], spacing: 10)
+        fillWidth(suggestionSection)
+        let stack = vertical([folder, codex, card(privacySection, inset: 16), suggestionSection], spacing: 20)
         fillWidth(stack)
         return stack
     }
 
-    private func setupStep(number: String, title: String, description: NSTextField, controls: [NSView]) -> NSView {
-        let text = vertical([label("\(number)  \(title)", size: 14, weight: .semibold), description], spacing: 6)
+    private func settingsSection(title: String, description: NSTextField, controls: [NSView]) -> NSView {
+        let text = vertical([label(title, size: 14, weight: .semibold), description], spacing: 6)
         fillWidth(text)
         let controlsRow = horizontal(controls + [spacer()], spacing: 8)
         let stack = vertical([text, controlsRow], spacing: 9)
@@ -333,14 +314,14 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         return stack
     }
 
-    private func rebuildPreviews() {
-        removeRows(from: previewRows)
-        if state.previews.isEmpty {
-            let empty = wrapping("Your preview names will appear here. Nothing is renamed until you enable automatic naming.", size: 12)
+    private func rebuildSuggestions() {
+        removeRows(from: suggestionRows)
+        if state.suggestions.isEmpty {
+            let empty = wrapping("Screenshots that need your review will appear here. Their original filenames are preserved.", size: 12)
             empty.textColor = .secondaryLabelColor
-            previewRows.addArrangedSubview(empty)
+            suggestionRows.addArrangedSubview(empty)
         } else {
-            for item in state.previews {
+            for item in state.suggestions {
                 let original = wrapping(item.original, size: 11)
                 original.textColor = .secondaryLabelColor
                 let proposed = wrapping(item.proposed, size: 13, weight: .medium)
@@ -348,10 +329,10 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
                 details.textColor = .secondaryLabelColor
                 let row = vertical([original, proposed, details], spacing: 5)
                 fillWidth(row)
-                previewRows.addArrangedSubview(card(row, inset: 12))
+                suggestionRows.addArrangedSubview(card(row, inset: 12))
             }
         }
-        fillWidth(previewRows)
+        fillWidth(suggestionRows)
     }
 
     private func updateHistory() {
@@ -363,7 +344,7 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         }
         if state.history.isEmpty {
             if emptyHistoryView == nil {
-                let empty = wrapping("No renames yet. Once automatic naming is enabled, recent screenshots and Undo actions appear here.", size: 13)
+                let empty = wrapping("No renames yet. New screenshots and Undo actions appear here as they are named.", size: 13)
                 empty.textColor = .secondaryLabelColor
                 historyRows.addArrangedSubview(empty)
                 empty.widthAnchor.constraint(equalTo: historyRows.widthAnchor).isActive = true
@@ -427,6 +408,10 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         for row in historyViews.values { row.undo.isEnabled = row.item.canUndo && !state.isBusy }
     }
 
+    private var canRetry: Bool {
+        (state.isEnabled || state.status == "Needs attention") && !state.isBusy && !state.isPaused
+    }
+
     private func rebuildMenu() {
         let symbol: String
         switch state.status {
@@ -451,10 +436,10 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
             menu.addItem(reason)
         }
         menu.addItem(.separator())
-        menu.addItem(menuItem("Settings & Preview…", #selector(openSettings), key: ","))
+        menu.addItem(menuItem("Settings…", #selector(openSettings), key: ","))
         menu.addItem(menuItem("History…", #selector(openHistory)))
         menu.addItem(menuItem(state.isPaused ? "Resume" : "Pause", #selector(togglePause), enabled: state.isEnabled))
-        menu.addItem(menuItem("Retry Pending Captures", #selector(retry), enabled: state.isEnabled && !state.isBusy && !state.isPaused))
+        menu.addItem(menuItem(state.isEnabled ? "Retry Pending Captures" : "Retry Automatic Naming", #selector(retry), enabled: canRetry))
         if !state.history.isEmpty {
             menu.addItem(.separator())
             let recent = NSMenuItem(title: "Recent Renames", action: nil, keyEquivalent: "")
@@ -495,13 +480,7 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
         statusItem.menu = menu
     }
 
-    private func refreshEnablement() {
-        enableButton.isEnabled = consent.state == .on && state.canEnable && !state.isBusy && !state.isEnabled
-    }
-
     @objc private func chooseFolder() { actions.chooseFolder() }
-    @objc private func preview() { actions.preview() }
-    @objc private func enable() { actions.enable() }
     @objc private func togglePause() { actions.togglePause() }
     @objc private func retry() { actions.retry() }
     @objc private func checkCodex() { actions.checkCodex() }
@@ -510,9 +489,8 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
     @objc private func toggleAutomaticUpdates() { actions.toggleAutomaticUpdates() }
     @objc private func quit() { actions.quit() }
     @objc private func clearHistory() { actions.clearHistory() }
-    @objc private func consentChanged() { refreshEnablement() }
     @objc private func changePane() {
-        setupPane.isHidden = segments.selectedSegment != 0
+        settingsPane.isHidden = segments.selectedSegment != 0
         historyPane.isHidden = segments.selectedSegment != 1
         refreshVisibleRows()
     }
@@ -524,6 +502,33 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
     @objc private func undoMenu(_ sender: NSMenuItem) {
         if let raw = sender.representedObject as? String, let id = UUID(uuidString: raw) { actions.undo(id) }
     }
+    /// Configure the default once, while preserving any later user choice.
+    /// The controller displays any issue without interrupting application startup.
+    func enableLoginAtStartup() -> String? {
+        let preferences = UserDefaults.standard
+        guard !preferences.bool(forKey: "loginItemConfigured") else { return nil }
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            preferences.set(true, forKey: "loginItemConfigured")
+            return nil
+        case .requiresApproval:
+            preferences.set(true, forKey: "loginItemConfigured")
+            return "Open at Login needs approval in System Settings → General → Login Items."
+        default:
+            do {
+                try SMAppService.mainApp.register()
+                preferences.set(true, forKey: "loginItemConfigured")
+                refreshLoginMenuItem()
+                if SMAppService.mainApp.status == .requiresApproval {
+                    return "Open at Login needs approval in System Settings → General → Login Items."
+                }
+                return nil
+            } catch {
+                return "Couldn’t enable Open at Login. Run Screenshot Renamer from its installed Applications location. \(error.localizedDescription)"
+            }
+        }
+    }
+
     @objc private func toggleLogin() {
         do {
             switch SMAppService.mainApp.status {
@@ -538,6 +543,7 @@ final class AppUI: NSObject, NSWindowDelegate, NSMenuDelegate {
                     SMAppService.openSystemSettingsLoginItems()
                 }
             }
+            UserDefaults.standard.set(true, forKey: "loginItemConfigured")
             refreshLoginMenuItem()
         } catch {
             let alert = NSAlert()

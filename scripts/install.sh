@@ -29,4 +29,5 @@ if [[ -e "$DESTINATION_APP" ]]; then
 fi
 mv "$STAGING_DIRECTORY/Screenshot Renamer.app" "$DESTINATION_APP"
 printf 'Installed: %s\n' "$DESTINATION_APP"
-printf 'Open the installed app, choose your Desktop, and run a preview before enabling automatic naming.\n'
+/usr/bin/open "$DESTINATION_APP"
+printf 'Started Screenshot Renamer. Allow Desktop access if macOS asks.\n'
